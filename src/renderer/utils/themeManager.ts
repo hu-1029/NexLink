@@ -33,6 +33,12 @@ export function applyThemeColors(rawBg: string, rawFg: string) {
     [class*="bg-white dark:bg-[#181c26]"]:not(.lan-tooltip-box),
     div[class*="bg-white"]:not(button):not(input):not(span):not(label):not([class*="rounded-full"]):not(.lan-tooltip-box) {
       background-color: ${bg} !important;
+    }
+
+    .glow-card:not(:hover),
+    [class*="rounded-[22px]"]:not(.lan-tooltip-box):not(.glow-card),
+    [class*="bg-white dark:bg-[#181c26]"]:not(.lan-tooltip-box):not(.glow-card),
+    div[class*="bg-white"]:not(button):not(input):not(span):not(label):not([class*="rounded-full"]):not(.lan-tooltip-box):not(.glow-card) {
       border: 1px solid rgba(128, 128, 128, 0.18) !important;
       box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.08) !important;
     }
