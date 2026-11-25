@@ -17,6 +17,7 @@ dist-electron/
 out/
 release/
 build/
+!build/installer.nsh
 *.exe
 *.dll
 !resources/mihomo/wintun.dll
