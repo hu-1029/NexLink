@@ -16,7 +16,12 @@ import { tunServiceManager, verifyMihomoInstallSource } from '../network/service
 import { isCurrentProcessAdmin } from '../network/tun-checker';
 import { createProxyTlsSocket } from '../network/wintun-manager';
 import { storageManager } from '../storage/store';
-import { extractSha256FromText, isValidGithubReleaseUrl, updateService } from './updater';
+import {
+  extractSha256FromText,
+  fetchWithSafeRedirects,
+  isValidGithubReleaseUrl,
+  updateService,
+} from './updater';
 
 export interface CoreUpdateResult {
   success: boolean;
@@ -51,19 +56,36 @@ export function selectMihomoWindowsAsset(assets: any[], arch: string = process.a
 }
 
 /**
- * 使用 Node https（支持本地 HTTP CONNECT 代理隧道与 301/302 重定向）下载数据
+ * 校验 ZIP 归档条目路径是否存在 Zip Slip 路径穿越或绝对路径逃逸风险
  */
-function httpsGetBuffer(
+export function isSafeZipEntryPath(entryFullName: string): boolean {
+  if (typeof entryFullName !== 'string' || !entryFullName.trim()) return false;
+  if (entryFullName.includes('\0')) return false;
+  if (/^[\\/]/.test(entryFullName) || /^[a-zA-Z]:/.test(entryFullName)) return false;
+  const segments = entryFullName.split(/[\\/]+/).filter(Boolean);
+  if (segments.length === 0) return false;
+  return !segments.some((seg) => seg === '..');
+}
+
+/**
+ * 使用 Node https（支持本地 HTTP CONNECT 代理隧道、3xx 重定向域名白名单二次校验与响应大小上限）下载数据
+ */
+export function httpsGetBuffer(
   url: string,
   headers: Record<string, string>,
   timeoutMs: number,
   proxyPort?: number,
   redirectCount: number = 0,
-  onDownloadProgress?: (downloadedBytes: number, totalBytes: number) => void
+  onDownloadProgress?: (downloadedBytes: number, totalBytes: number) => void,
+  maxBytes: number = 100 * 1024 * 1024,
+  validateUrl: (u: string) => boolean = isValidGithubReleaseUrl
 ): Promise<{ status: number; body: Buffer }> {
   return new Promise((resolve, reject) => {
     if (redirectCount > 6) {
       return reject(new Error('请求重定向次数过多'));
+    }
+    if (!validateUrl(url)) {
+      return reject(new Error(`安全拦截: 请求地址不在官方白名单内 (${url})`));
     }
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:') {
@@ -105,22 +127,48 @@ function httpsGetBuffer(
           res.headers.location
         ) {
           res.resume();
-          const nextUrl = res.headers.location.startsWith('http')
-            ? res.headers.location
-            : new URL(res.headers.location, url).toString();
-          httpsGetBuffer(nextUrl, headers, timeoutMs, proxyPort, redirectCount + 1, onDownloadProgress)
+          const nextUrl = new URL(res.headers.location, url).toString();
+          if (!validateUrl(nextUrl)) {
+            return reject(new Error(`安全拦截: 重定向目标域名不在官方白名单内 (${nextUrl})`));
+          }
+          httpsGetBuffer(
+            nextUrl,
+            headers,
+            timeoutMs,
+            proxyPort,
+            redirectCount + 1,
+            onDownloadProgress,
+            maxBytes,
+            validateUrl
+          )
             .then(resolve)
             .catch(reject);
           return;
         }
 
         const totalBytes = Number(res.headers['content-length'] || 0);
+        if (totalBytes > maxBytes) {
+          res.resume();
+          return reject(
+            new Error(`响应体过大 (${Math.round(totalBytes / 1024 / 1024)}MB)，超出安全上限`)
+          );
+        }
+
         let receivedBytes = 0;
         let lastNotify = 0;
+        let settled = false;
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => {
-          chunks.push(chunk);
+          if (settled) return;
           receivedBytes += chunk.length;
+          if (receivedBytes > maxBytes) {
+            settled = true;
+            const sizeErr = new Error(`响应数据体积超过安全上限 (${Math.round(maxBytes / 1024 / 1024)}MB)，已中止下载`);
+            req.destroy(sizeErr);
+            reject(sizeErr);
+            return;
+          }
+          chunks.push(chunk);
           if (onDownloadProgress) {
             const now = Date.now();
             if (now - lastNotify >= 250 || (totalBytes > 0 && receivedBytes >= totalBytes)) {
@@ -130,9 +178,16 @@ function httpsGetBuffer(
           }
         });
         res.on('end', () => {
+          if (settled) return;
+          settled = true;
           resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks) });
         });
-        res.on('error', reject);
+        res.on('error', (err) => {
+          if (!settled) {
+            settled = true;
+            reject(err);
+          }
+        });
       });
 
       req.on('timeout', () => {
@@ -150,7 +205,9 @@ async function fetchBufferSmart(
   url: string,
   headers: Record<string, string> = {},
   timeoutMs: number = 15000,
-  onDownloadProgress?: (downloadedBytes: number, totalBytes: number) => void
+  onDownloadProgress?: (downloadedBytes: number, totalBytes: number) => void,
+  maxBytes: number = 100 * 1024 * 1024,
+  validateUrl: (u: string) => boolean = isValidGithubReleaseUrl
 ): Promise<Buffer> {
   const status = mihomoManager.getStatus();
   const proxyPort = status.running && status.mixedPort > 0 ? status.mixedPort : 0;
@@ -158,14 +215,36 @@ async function fetchBufferSmart(
   // 若本地代理正在运行，优先走代理隧道（避免国内直连 GitHub 被重置 net::ERR_CONNECTION_ABORTED）
   if (proxyPort > 0) {
     try {
-      const res = await httpsGetBuffer(url, headers, timeoutMs, proxyPort, 0, onDownloadProgress);
+      const res = await httpsGetBuffer(
+        url,
+        headers,
+        timeoutMs,
+        proxyPort,
+        0,
+        onDownloadProgress,
+        maxBytes,
+        validateUrl
+      );
       if (res.status >= 200 && res.status < 300) {
         return res.body;
       }
       throw new Error(`HTTP ${res.status}`);
     } catch (proxyErr: any) {
+      const pMsg = String(proxyErr?.message || '');
+      if (pMsg.includes('安全拦截') || pMsg.includes('安全上限') || pMsg.includes('响应体过大') || pMsg.includes('重定向次数过多')) {
+        throw proxyErr;
+      }
       // 代理失败时回退直连尝试一次
-      const directRes = await httpsGetBuffer(url, headers, timeoutMs, 0, 0, onDownloadProgress);
+      const directRes = await httpsGetBuffer(
+        url,
+        headers,
+        timeoutMs,
+        0,
+        0,
+        onDownloadProgress,
+        maxBytes,
+        validateUrl
+      );
       if (directRes.status >= 200 && directRes.status < 300) {
         return directRes.body;
       }
@@ -175,24 +254,66 @@ async function fetchBufferSmart(
 
   // 未运行代理时尝试直连
   try {
-    const directRes = await httpsGetBuffer(url, headers, timeoutMs, 0, 0, onDownloadProgress);
+    const directRes = await httpsGetBuffer(
+      url,
+      headers,
+      timeoutMs,
+      0,
+      0,
+      onDownloadProgress,
+      maxBytes,
+      validateUrl
+    );
     if (directRes.status >= 200 && directRes.status < 300) {
       return directRes.body;
     }
     throw new Error(`HTTP ${directRes.status}`);
   } catch (err: any) {
-    // 兼容系统代理已开启的场景
-    if (Electron.net?.fetch) {
+    const dMsg = String(err?.message || '');
+    if (dMsg.includes('安全拦截') || dMsg.includes('安全上限') || dMsg.includes('响应体过大') || dMsg.includes('重定向次数过多')) {
+      throw err;
+    }
+    // 兼容系统代理已开启的场景（同样走手动重定向白名单与响应大小限制）
+    if (typeof Electron.net?.fetch === 'function') {
       const controller = new AbortController();
       const tid = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const resp = await Electron.net.fetch(url, {
-          method: 'GET',
-          headers: { 'User-Agent': 'NexLink-Desktop-Client', ...headers },
-          signal: controller.signal,
-        });
+        const resp = await fetchWithSafeRedirects(
+          url,
+          {
+            method: 'GET',
+            headers: { 'User-Agent': 'NexLink-Desktop-Client', ...headers },
+            signal: controller.signal,
+          },
+          { validateUrl }
+        );
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        return Buffer.from(await resp.arrayBuffer());
+        const contentLen = Number(resp.headers.get('content-length') || 0);
+        if (contentLen > maxBytes) {
+          await resp.body?.cancel().catch(() => {});
+          throw new Error(`响应体过大 (${Math.round(contentLen / 1024 / 1024)}MB)，超出安全上限`);
+        }
+        if (!resp.body) {
+          const buf = Buffer.from(await resp.arrayBuffer());
+          if (buf.length > maxBytes) throw new Error('响应数据体积超过安全上限');
+          return buf;
+        }
+        const reader = resp.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let got = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            got += value.length;
+            if (got > maxBytes) {
+              await reader.cancel().catch(() => {});
+              throw new Error('响应数据体积超过安全上限，已中止下载');
+            }
+            chunks.push(value);
+          }
+        }
+        return Buffer.concat(chunks);
       } finally {
         clearTimeout(tid);
       }
@@ -207,6 +328,13 @@ export class CoreUpdaterService {
   public async checkAndUpdateCore(options?: {
     force?: boolean;
     onProgress?: (msg: string) => void;
+    fetchBuffer?: (
+      url: string,
+      headers?: Record<string, string>,
+      timeoutMs?: number,
+      onDownloadProgress?: (downloadedBytes: number, totalBytes: number) => void,
+      maxBytes?: number
+    ) => Promise<Buffer>;
   }): Promise<CoreUpdateResult> {
     if (this.isUpdating) {
       return {
@@ -225,6 +353,7 @@ export class CoreUpdaterService {
         // ignore
       }
     };
+    const fetchBuf = options?.fetchBuffer ?? fetchBufferSmart;
     const tmpDir = path.join(os.tmpdir(), `nexlink-core-update-${Date.now()}`);
 
     try {
@@ -232,10 +361,12 @@ export class CoreUpdaterService {
 
       // 1. 查询 MetaCubeX/mihomo 最新稳定版本
       emit('正在连接 GitHub 查询最新 Mihomo 版本...');
-      const apiBuf = await fetchBufferSmart(
+      const apiBuf = await fetchBuf(
         'https://api.github.com/repos/MetaCubeX/mihomo/releases/latest',
         { Accept: 'application/vnd.github.v3+json' },
-        15000
+        15000,
+        undefined,
+        2 * 1024 * 1024
       );
       const rel = JSON.parse(apiBuf.toString('utf8')) as any;
       const latestTag = String(rel?.tag_name || '').trim();
@@ -280,12 +411,25 @@ export class CoreUpdaterService {
         });
         if (checksumAsset?.browser_download_url && isValidGithubReleaseUrl(checksumAsset.browser_download_url)) {
           try {
-            const cBuf = await fetchBufferSmart(checksumAsset.browser_download_url, {}, 12000);
+            const cBuf = await fetchBuf(
+              checksumAsset.browser_download_url,
+              {},
+              12000,
+              undefined,
+              2 * 1024 * 1024
+            );
             expectedZipSha256 = extractSha256FromText(cBuf.toString('utf8'), targetAsset.name);
-          } catch {
-            // 校验文件拉取失败不阻塞，后续仍严格校验 PE 与 -v 执行
+          } catch (checksumErr: any) {
+            throw new Error(
+              `拉取内核 SHA-256 校验文件失败，已中止更新，请重试: ${checksumErr?.message || checksumErr}`
+            );
           }
         }
+      }
+
+      // Fail-Closed (P0-4)：必须获取到有效的预期 SHA-256，绝不允许在无校验值时继续下载和执行
+      if (!expectedZipSha256 || !/^[a-f0-9]{64}$/i.test(expectedZipSha256)) {
+        throw new Error('未在官方 Release 中获取到内核压缩包的 SHA-256 校验值，已拒绝下载并中止更新，请稍后重试');
       }
 
       // 2. 下载核心压缩包到临时目录
@@ -293,7 +437,7 @@ export class CoreUpdaterService {
       const zipPath = path.join(tmpDir, String(targetAsset.name || 'mihomo.zip'));
       const totalAssetBytes = Number(targetAsset.size || 0);
       emit(`正在下载 ${latestTag} 核心包...`);
-      const zipBuf = await fetchBufferSmart(downloadUrl, {}, 120000, (got, total) => {
+      const zipBuf = await fetchBuf(downloadUrl, {}, 120000, (got, total) => {
         const denom = total > 0 ? total : totalAssetBytes;
         const gotMb = (got / (1024 * 1024)).toFixed(1);
         if (denom > 0) {
@@ -303,25 +447,59 @@ export class CoreUpdaterService {
         } else {
           emit(`正在下载 ${latestTag}（已下载 ${gotMb} MB）...`);
         }
-      });
+      }, 100 * 1024 * 1024);
       fs.writeFileSync(zipPath, zipBuf);
 
-      if (expectedZipSha256) {
-        emit('正在校验压缩包完整性并解压...');
-        const actualZipSha256 = crypto.createHash('sha256').update(zipBuf).digest('hex').toLowerCase();
-        if (actualZipSha256 !== expectedZipSha256.toLowerCase()) {
-          throw new Error(`内核压缩包 SHA-256 校验失败 (预期 ${expectedZipSha256.slice(0, 12)}..., 实际 ${actualZipSha256.slice(0, 12)}...)`);
-        }
+      emit('正在校验压缩包完整性并解压...');
+      const actualZipSha256 = crypto.createHash('sha256').update(zipBuf).digest('hex').toLowerCase();
+      if (actualZipSha256 !== expectedZipSha256.toLowerCase()) {
+        throw new Error(`内核压缩包 SHA-256 校验失败 (预期 ${expectedZipSha256.slice(0, 12)}..., 实际 ${actualZipSha256.slice(0, 12)}...)`);
       }
 
-      // 3. 解压并提取新 mihomo.exe
+      // 3. 安全解压并提取新 mihomo.exe（使用 .NET ZipFile 逐条检查 Zip Slip 与解压总大小上限）
       const extractDir = path.join(tmpDir, 'extracted');
       fs.mkdirSync(extractDir, { recursive: true });
       const escapedZip = zipPath.replace(/'/g, "''");
       const escapedExtract = extractDir.replace(/'/g, "''");
+      const safeExtractPs = [
+        "$ErrorActionPreference = 'Stop'",
+        "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+        `$zipPath = '${escapedZip}'`,
+        `$destDir = [System.IO.Path]::GetFullPath('${escapedExtract}')`,
+        "$destPrefix = if ($destDir.EndsWith('\\')) { $destDir } else { $destDir + '\\' }",
+        "$maxUncompressed = 200 * 1024 * 1024",
+        "$totalUncompressed = 0L",
+        "$zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)",
+        "try {",
+        "    foreach ($entry in $zip.Entries) {",
+        "        $name = $entry.FullName",
+        "        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name.StartsWith('\\') -or ($name -match '^[a-zA-Z]:')) {",
+        "            throw ('Zip Slip unsafe entry path rejected: ' + $name)",
+        "        }",
+        "        $segs = $name.Split(@('/', '\\'), [System.StringSplitOptions]::RemoveEmptyEntries)",
+        "        if ($segs -contains '..') { throw ('Zip Slip traversal rejected: ' + $name) }",
+        "        $totalUncompressed += [long]$entry.Length",
+        "        if ($totalUncompressed -gt $maxUncompressed) { throw 'Zip archive exceeds uncompressed size safety limit' }",
+        "        $targetPath = [System.IO.Path]::GetFullPath((Join-Path $destDir $name))",
+        "        if (-not $targetPath.StartsWith($destPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {",
+        "            throw ('Zip Slip escaped destination dir: ' + $name)",
+        "        }",
+        "        if ($name.EndsWith('/') -or $name.EndsWith('\\')) {",
+        "            [System.IO.Directory]::CreateDirectory($targetPath) | Out-Null",
+        "        } else {",
+        "            $parentDir = [System.IO.Path]::GetDirectoryName($targetPath)",
+        "            if ($parentDir) { [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null }",
+        "            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $targetPath, $true)",
+        "        }",
+        "    }",
+        "} finally {",
+        "    $zip.Dispose()",
+        "}",
+      ].join('\r\n');
+      const encodedExtractPs = Buffer.from(safeExtractPs, 'utf16le').toString('base64');
       execFileSync(
         'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', `Expand-Archive -LiteralPath '${escapedZip}' -DestinationPath '${escapedExtract}' -Force`],
+        ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedExtractPs],
         { windowsHide: true, timeout: 25000 }
       );
 
@@ -331,6 +509,19 @@ export class CoreUpdaterService {
         throw new Error('压缩包内未找到可执行文件 (.exe)');
       }
       const newExeTmpPath = path.join(extractDir, exeName);
+      const exeLstat = fs.lstatSync(newExeTmpPath);
+      const realExtractDir = fs.realpathSync(extractDir);
+      const realExeTmpPath = fs.realpathSync(newExeTmpPath);
+      const relExe = path.relative(realExtractDir.toLowerCase(), realExeTmpPath.toLowerCase());
+      if (
+        !exeLstat.isFile() ||
+        exeLstat.isSymbolicLink() ||
+        !relExe ||
+        relExe.startsWith('..') ||
+        path.isAbsolute(relExe)
+      ) {
+        throw new Error('提取的内核文件路径异常或为符号链接，已拒绝执行');
+      }
       const exeBytes = fs.readFileSync(newExeTmpPath);
       if (exeBytes.length < 1024 * 1024 || exeBytes[0] !== 0x4d || exeBytes[1] !== 0x5a) {
         throw new Error('提取的内核文件非有效 Windows PE 可执行程序');

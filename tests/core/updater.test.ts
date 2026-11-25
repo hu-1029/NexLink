@@ -1,9 +1,15 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { UpdateService, isValidGithubReleaseUrl, extractSha256FromText } from '../../src/main/services/updater';
+import {
+  UpdateService,
+  fetchWithSafeRedirects,
+  isValidGithubReleaseUrl,
+  extractSha256FromText,
+} from '../../src/main/services/updater';
 import { StorageManager } from '../../src/main/storage/store';
 
 describe('软件版本检测与自动更新管理器测试 (Updater Tests)', () => {
@@ -104,7 +110,22 @@ describe('软件版本检测与自动更新管理器测试 (Updater Tests)', () 
       'raw.githubusercontent.com 应当允许'
     );
 
-    // 恶意与非官方域名必须彻底拦截
+    // 恶意与非官方/泛子域必须彻底拦截
+    assert.strictEqual(
+      isValidGithubReleaseUrl('https://release-assets.githubusercontent.com/github-production-release-asset/123/NexLink.exe'),
+      true,
+      'release-assets.githubusercontent.com 应当允许'
+    );
+    assert.strictEqual(
+      isValidGithubReleaseUrl('https://gist.github.com/attacker/123/NexLink.exe'),
+      false,
+      'gist.github.com 非法子域必须拦截'
+    );
+    assert.strictEqual(
+      isValidGithubReleaseUrl('https://user-images.githubusercontent.com/123/NexLink.exe'),
+      false,
+      'user-images.githubusercontent.com 非法子域必须拦截'
+    );
     assert.strictEqual(
       isValidGithubReleaseUrl('http://github.com/NexLink.exe'),
       false,
@@ -163,5 +184,170 @@ describe('软件版本检测与自动更新管理器测试 (Updater Tests)', () 
     assert.ok(updater.compareVersions('0.2.0-beta.1', '0.1.0') > 0, '0.2.0-beta.1 应高于 0.1.0');
     assert.ok(updater.compareVersions('0.2.0-rc.2', '0.2.0-rc.1') > 0, 'rc.2 应高于 rc.1');
     assert.ok(updater.compareVersions('0.2.0', '0.2.0-rc.2') > 0, '正式版应高于候选版');
+  });
+
+  test('10. P0-4 & 3xx 防御：fetchWithSafeRedirects 拦截非白名单跳转并放行官方 CDN 跳转', async () => {
+    // 1) 跳转到官方 objects.githubusercontent.com -> 放行
+    const okRes = await fetchWithSafeRedirects(
+      'https://github.com/hu-1029/NexLink/releases/download/v0.2.0/Windows-NexLink-Setup.exe',
+      {},
+      {
+        fetchFn: (async (url: string) => {
+          if (url.startsWith('https://github.com/')) {
+            return new Response(null, {
+              status: 302,
+              headers: {
+                location: 'https://objects.githubusercontent.com/github-production-release-asset-2e65be/abc/setup.exe',
+              },
+            });
+          }
+          return new Response('OK_PAYLOAD', { status: 200 });
+        }) as unknown as typeof fetch,
+      }
+    );
+    assert.strictEqual(okRes.status, 200);
+    assert.strictEqual(await okRes.text(), 'OK_PAYLOAD');
+
+    // 2) 302 跳转到恶意域名 -> 必须拦截
+    await assert.rejects(
+      () =>
+        fetchWithSafeRedirects(
+          'https://github.com/hu-1029/NexLink/releases/download/v0.2.0/Windows-NexLink-Setup.exe',
+          {},
+          {
+            fetchFn: (async () =>
+              new Response(null, {
+                status: 302,
+                headers: { location: 'https://evil-cdn.attacker.com/trojan.exe' },
+              })) as unknown as typeof fetch,
+          }
+        ),
+      /不在官方白名单内/
+    );
+
+    // 3) 302 降级跳转到 http:// -> 必须拦截
+    await assert.rejects(
+      () =>
+        fetchWithSafeRedirects(
+          'https://github.com/hu-1029/NexLink/releases/download/v0.2.0/Windows-NexLink-Setup.exe',
+          {},
+          {
+            fetchFn: (async () =>
+              new Response(null, {
+                status: 302,
+                headers: { location: 'http://github.com/downgraded.exe' },
+              })) as unknown as typeof fetch,
+          }
+        ),
+      /不在官方白名单内/
+    );
+  });
+
+  test('11. P0-4 Fail-Closed 与 Pre-release 过滤：无 SHA-256 或拉取校验文件失败直接拒绝更新，默认过滤预发布版', async () => {
+    const svc = new UpdateService();
+    const releases = [
+      {
+        tag_name: 'v9.9.0-beta.1',
+        name: 'v9.9.0-beta.1',
+        draft: false,
+        prerelease: true,
+        html_url: 'https://github.com/hu-1029/NexLink/releases/tag/v9.9.0-beta.1',
+        body: 'SHA256: ' + 'a'.repeat(64),
+        assets: [
+          {
+            name: 'Windows-NexLink-Setup.exe',
+            browser_download_url: 'https://github.com/hu-1029/NexLink/releases/download/v9.9.0-beta.1/Windows-NexLink-Setup.exe',
+            size: 1024,
+          },
+        ],
+      },
+      {
+        tag_name: 'v9.8.0',
+        name: 'v9.8.0',
+        draft: false,
+        prerelease: false,
+        html_url: 'https://github.com/hu-1029/NexLink/releases/tag/v9.8.0',
+        body: 'No hash here',
+        assets: [
+          {
+            name: 'Windows-NexLink-Setup.exe',
+            browser_download_url: 'https://github.com/hu-1029/NexLink/releases/download/v9.8.0/Windows-NexLink-Setup.exe',
+            size: 1024,
+          },
+          {
+            name: 'Windows-NexLink-Setup.exe.sha256',
+            browser_download_url: 'https://github.com/hu-1029/NexLink/releases/download/v9.8.0/Windows-NexLink-Setup.exe.sha256',
+            size: 128,
+          },
+        ],
+      },
+    ];
+
+    // 1) 默认跳过 prerelease (v9.9.0-beta.1)，选定 v9.8.0；且当 .sha256 拉取失败时，Fail-Closed 拦截并保留 htmlUrl 供手动查看
+    const failChecksumInfo = await svc.checkUpdate({
+      repo: 'hu-1029/NexLink',
+      fetchFn: (async (url: string) => {
+        if (url.includes('/releases?')) {
+          return new Response(JSON.stringify(releases), { status: 200 });
+        }
+        return new Response('Server Error', { status: 500 });
+      }) as unknown as typeof fetch,
+    });
+    assert.strictEqual(failChecksumInfo.latestVersion, '9.8.0', '默认不得选中 pre-release 版本');
+    assert.strictEqual(failChecksumInfo.isPrerelease, false);
+    assert.strictEqual(failChecksumInfo.downloadUrl, undefined, '校验文件拉取失败时必须清空 downloadUrl 阻止下载');
+    assert.match(failChecksumInfo.error || '', /校验文件失败/);
+    assert.strictEqual(failChecksumInfo.htmlUrl, 'https://github.com/hu-1029/NexLink/releases/tag/v9.8.0');
+
+    // 直接调用 downloadUpdate（缺少 expectedSha256）同样必须 Fail-Closed 拒绝
+    const dlBlocked = await svc.downloadUpdate(
+      'https://github.com/hu-1029/NexLink/releases/download/v9.8.0/Windows-NexLink-Setup.exe'
+    );
+    assert.strictEqual(dlBlocked.success, false);
+    assert.match(dlBlocked.error || '', /SHA-256/);
+
+    // 2) 当包含有效 SHA-256 时，checkUpdate 正常返回 downloadUrl，且 downloadUpdate 校验体积上限与真实哈希
+    const payload = Buffer.from('VALID_INSTALLER_BYTES');
+    const validSha = crypto.createHash('sha256').update(payload).digest('hex');
+    const okInfo = await svc.checkUpdate({
+      repo: 'hu-1029/NexLink',
+      fetchFn: (async (url: string) => {
+        if (url.includes('/releases?')) {
+          return new Response(
+            JSON.stringify([
+              {
+                ...releases[1],
+                assets: [
+                  { ...releases[1].assets[0], digest: `sha256:${validSha}` },
+                ],
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+        return new Response('Not Found', { status: 404 });
+      }) as unknown as typeof fetch,
+    });
+    assert.strictEqual(okInfo.error, undefined);
+    assert.strictEqual(okInfo.expectedSha256, validSha);
+    assert.ok(okInfo.downloadUrl);
+
+    // 超出 maxBytes 上限必须被拦截
+    const oversizeRes = await svc.downloadUpdate(undefined, undefined, {
+      maxBytes: 4,
+      fetchFn: (async () => new Response(payload, { status: 200 })) as unknown as typeof fetch,
+    });
+    assert.strictEqual(oversizeRes.success, false);
+    assert.match(oversizeRes.error || '', /安全上限/);
+
+    // 哈希匹配时下载通过校验
+    const dlOk = await svc.downloadUpdate(undefined, undefined, {
+      fetchFn: (async () => new Response(payload, { status: 200 })) as unknown as typeof fetch,
+    });
+    assert.strictEqual(dlOk.success, true);
+    assert.strictEqual(dlOk.actualSha256, validSha);
+    if (dlOk.filePath && fs.existsSync(dlOk.filePath)) {
+      fs.unlinkSync(dlOk.filePath);
+    }
   });
 });

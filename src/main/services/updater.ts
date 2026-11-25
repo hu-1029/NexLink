@@ -15,28 +15,80 @@ import { systemProxyManager } from '../network/system-proxy';
 import { mihomoManager } from '../core/mihomo-process';
 import { IPC_CHANNELS } from '../../shared/ipc-events';
 
+export const ALLOWED_GITHUB_RELEASE_HOSTS = new Set<string>([
+  'github.com',
+  'api.github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+  'github-releases.githubusercontent.com',
+  'raw.githubusercontent.com',
+  'github-production-release-asset-2e65be.s3.amazonaws.com',
+]);
+
 /**
- * 校验更新包下载地址是否来自官方 GitHub 安全域名
+ * 校验更新包下载地址是否来自官方 GitHub 安全域名（精确白名单，禁止泛 *.github.com / *.githubusercontent.com 通配）
  */
 export function isValidGithubReleaseUrl(rawUrl: string): boolean {
   try {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== 'https:') return false;
-    const validExactHosts = [
-      'github.com',
-      'api.github.com',
-      'objects.githubusercontent.com',
-      'raw.githubusercontent.com',
-      'github-production-release-asset-2e65be.s3.amazonaws.com',
-    ];
-    return (
-      validExactHosts.includes(parsed.hostname) ||
-      parsed.hostname.endsWith('.github.com') ||
-      parsed.hostname.endsWith('.githubusercontent.com')
-    );
+    return ALLOWED_GITHUB_RELEASE_HOSTS.has(parsed.hostname.toLowerCase());
   } catch {
     return false;
   }
+}
+
+export interface SafeFetchOptions {
+  maxRedirects?: number;
+  validateUrl?: (url: string) => boolean;
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * 禁止自动盲跟随 3xx：逐跳手动校验重定向目标域名，防止开放重定向/域名绕过
+ */
+export async function fetchWithSafeRedirects(
+  initialUrl: string,
+  init: RequestInit = {},
+  options?: SafeFetchOptions
+): Promise<Response> {
+  const maxRedirects = options?.maxRedirects ?? 6;
+  const validateUrl = options?.validateUrl ?? isValidGithubReleaseUrl;
+  const fetchFn = options?.fetchFn ?? ((Electron.net?.fetch as typeof fetch) || globalThis.fetch);
+
+  let currentUrl = initialUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (!validateUrl(currentUrl)) {
+      throw new Error(`不安全的更新请求地址，已拦截非官方白名单域名: ${currentUrl}`);
+    }
+
+    const res = await fetchFn(currentUrl, {
+      ...init,
+      redirect: 'manual',
+    });
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      await res.body?.cancel().catch(() => {});
+      if (!location) {
+        throw new Error(`更新服务器返回重定向 (${res.status}) 但缺少 Location 响应头`);
+      }
+      const nextUrl = new URL(location, currentUrl).toString();
+      if (!validateUrl(nextUrl)) {
+        throw new Error(`安全拦截: 重定向目标域名不在官方白名单内 (${nextUrl})`);
+      }
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    if (res.url && !validateUrl(res.url)) {
+      await res.body?.cancel().catch(() => {});
+      throw new Error(`安全拦截: 最终响应地址不在官方白名单内 (${res.url})`);
+    }
+    return res;
+  }
+
+  throw new Error('更新请求重定向次数过多');
 }
 
 /**
@@ -137,13 +189,16 @@ export class UpdateService {
   }
 
   /**
-   * 检查软件更新 (使用 releases 列表 API，完整覆盖正式版与预发布版 Pre-release)
+   * 检查软件更新 (默认仅匹配正式版，可通过 allowPrerelease / includePrerelease 开启预发布版)
    */
   public async checkUpdate(options?: {
     repo?: string;
     mockUpdate?: boolean;
     mockVersion?: string;
     mockSha256?: string;
+    includePrerelease?: boolean;
+    fetchFn?: typeof fetch;
+    validateUrl?: (url: string) => boolean;
   }): Promise<UpdateInfo> {
     const currentVer = this.getCurrentVersion();
     const settings = storageManager.getSettings();
@@ -188,22 +243,28 @@ export class UpdateService {
       throw new Error(`非法的 GitHub 仓库全称格式: ${repo}`);
     }
 
-    // 改为请求全量版本列表 (per_page=10)，支持发现预发布版 (Pre-release)
+    // 请求版本列表 (per_page=10)，按用户配置决定是否包含预发布版 (Pre-release)
+    const allowPrerelease = Boolean(
+      options?.includePrerelease ?? (settings as { allowPrerelease?: boolean })?.allowPrerelease
+    );
     const apiUrl = `https://api.github.com/repos/${repo}/releases?per_page=10`;
 
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 9000);
 
-      const fetchFn = (Electron.net?.fetch as typeof fetch) || globalThis.fetch;
-      const response = await fetchFn(apiUrl, {
-        method: 'GET',
-        headers: {
-          'User-Agent': 'NexLink-Desktop-Client',
-          Accept: 'application/vnd.github.v3+json',
+      const response = await fetchWithSafeRedirects(
+        apiUrl,
+        {
+          method: 'GET',
+          headers: {
+            'User-Agent': 'NexLink-Desktop-Client',
+            Accept: 'application/vnd.github.v3+json',
+          },
+          signal: controller.signal,
         },
-        signal: controller.signal,
-      });
+        { fetchFn: options?.fetchFn, validateUrl: options?.validateUrl }
+      );
 
       clearTimeout(timeoutId);
 
@@ -227,8 +288,10 @@ export class UpdateService {
       const rawData = await response.json();
       const releaseList = (Array.isArray(rawData) ? rawData : [rawData]) as any[];
 
-      // 过滤掉草稿 (draft)
-      const validReleases = releaseList.filter((r) => !r.draft);
+      // 过滤草稿 (draft)，并在未开启预发布通道时过滤掉 pre-release
+      const validReleases = releaseList.filter(
+        (r) => !r.draft && (allowPrerelease || !r.prerelease)
+      );
 
       if (validReleases.length === 0) {
         const notFoundInfo: UpdateInfo = {
@@ -291,7 +354,9 @@ export class UpdateService {
         expectedSha256 = extractSha256FromText(targetRelease.body || '', assetName);
       }
 
-      // 若 body 中未声明，尝试检查 assets 中是否存在 .sha256 文件
+      // 若 body 中未声明，尝试检查 assets 中是否存在 .sha256 文件 (Fail-Closed: 拉取失败绝不静默放行)
+      let shaAssetFetchFailed = false;
+      const validateFn = options?.validateUrl ?? isValidGithubReleaseUrl;
       if (!expectedSha256) {
         const shaAsset = assets.find(
           (a: any) =>
@@ -300,18 +365,42 @@ export class UpdateService {
               a.name.toLowerCase().endsWith('.sha256.txt') ||
               a.name.toLowerCase() === 'shasums256.txt')
         );
-        if (shaAsset?.browser_download_url && isValidGithubReleaseUrl(shaAsset.browser_download_url)) {
+        if (shaAsset?.browser_download_url && validateFn(shaAsset.browser_download_url)) {
           try {
-            const shaRes = await fetchFn(shaAsset.browser_download_url, {
-              headers: { 'User-Agent': 'NexLink-Desktop-Client' },
-            });
+            const shaRes = await fetchWithSafeRedirects(
+              shaAsset.browser_download_url,
+              { headers: { 'User-Agent': 'NexLink-Desktop-Client' } },
+              { fetchFn: options?.fetchFn, validateUrl: options?.validateUrl }
+            );
             if (shaRes.ok) {
+              const shaLen = Number(shaRes.headers.get('content-length') || 0);
+              if (shaLen > 1024 * 1024) {
+                throw new Error('校验文件体积超出安全上限');
+              }
               const shaContent = await shaRes.text();
+              if (Buffer.byteLength(shaContent, 'utf8') > 1024 * 1024) {
+                throw new Error('校验文件体积超出安全上限');
+              }
               expectedSha256 = extractSha256FromText(shaContent, assetName);
+            } else {
+              shaAssetFetchFailed = true;
             }
           } catch (_err) {
             void _err;
+            shaAssetFetchFailed = true;
           }
+        }
+      }
+
+      const htmlUrl = targetRelease.html_url || `https://github.com/${repo}/releases`;
+      let failClosedError: string | undefined;
+      if (hasUpdate) {
+        if (!exeAsset?.browser_download_url) {
+          failClosedError = `发现新版本 v${latestVer}，暂未找到适配当前形态的安装包，请点击前往 GitHub Release 页面手动查看`;
+        } else if (!expectedSha256) {
+          failClosedError = shaAssetFetchFailed
+            ? `发现新版本 v${latestVer}，但拉取 SHA-256 校验文件失败，已中止更新；请重试或点击前往 GitHub Release 页面手动查看`
+            : `发现新版本 v${latestVer}，但未提供官方 SHA-256 校验值，出于安全策略已禁止自动下载，请点击前往 GitHub Release 页面手动查看`;
         }
       }
 
@@ -322,12 +411,13 @@ export class UpdateService {
         releaseName: targetRelease.name || `NexLink ${remoteTag}`,
         releaseDate: targetRelease.published_at ? targetRelease.published_at.split('T')[0] : undefined,
         releaseNotes: targetRelease.body || '无详细更新说明。',
-        downloadUrl: exeAsset?.browser_download_url || undefined,
+        downloadUrl: failClosedError ? undefined : exeAsset?.browser_download_url || undefined,
         assetName,
         assetSize: exeAsset?.size || 0,
         expectedSha256,
-        htmlUrl: targetRelease.html_url || `https://github.com/${repo}/releases`,
+        htmlUrl,
         isPrerelease: Boolean(targetRelease.prerelease),
+        ...(failClosedError ? { error: failClosedError } : {}),
       };
 
       this.latestUpdateInfo = updateInfo;
@@ -350,7 +440,12 @@ export class UpdateService {
    */
   public async downloadUpdate(
     downloadUrl?: string,
-    onProgress?: (progress: UpdateDownloadProgress) => void
+    onProgress?: (progress: UpdateDownloadProgress) => void,
+    downloadOptions?: {
+      fetchFn?: typeof fetch;
+      validateUrl?: (url: string) => boolean;
+      maxBytes?: number;
+    }
   ): Promise<{ success: boolean; filePath?: string; actualSha256?: string; error?: string }> {
     // 安全防护：优先使用主进程 checkUpdate 校验并缓存的下载地址
     const targetUrl = this.latestUpdateInfo?.downloadUrl || downloadUrl;
@@ -358,12 +453,26 @@ export class UpdateService {
       return { success: false, error: '未找到有效的更新下载链接' };
     }
 
+    const validateUrl = downloadOptions?.validateUrl ?? isValidGithubReleaseUrl;
     // 强校验下载地址域名安全白名单，拒绝任何来自非官方 GitHub 域名的下载请求
-    if (!isValidGithubReleaseUrl(targetUrl)) {
+    if (!validateUrl(targetUrl)) {
       return {
         success: false,
         error: `不安全的更新下载地址：仅允许来自 GitHub 官方安全域名的更新包 (${targetUrl})`,
       };
+    }
+
+    // Fail-Closed (P0-4)：必须具备有效的预期 SHA-256，严禁在无校验值时下载并放行安装包
+    const expectedSha256 = this.latestUpdateInfo?.expectedSha256?.trim().toLowerCase();
+    if (!expectedSha256 || !/^[a-f0-9]{64}$/.test(expectedSha256)) {
+      const missingHashErr =
+        '未获取到官方 SHA-256 校验值，已拒绝下载并中止更新；请重试或前往 GitHub Release 页面手动查看';
+      onProgress?.({
+        status: 'error',
+        error: missingHashErr,
+        updateInfo: this.latestUpdateInfo || undefined,
+      });
+      return { success: false, error: missingHashErr };
     }
 
     if (this.isDownloading) {
@@ -374,6 +483,7 @@ export class UpdateService {
     this.downloadedFileVerified = false;
     this.abortController = new AbortController();
 
+    const maxBytes = downloadOptions?.maxBytes ?? 300 * 1024 * 1024; // 300MB 安装包安全上限
     const tempDir = Electron.app?.getPath ? Electron.app.getPath('temp') : os.tmpdir();
     const rawFileName =
       this.latestUpdateInfo?.assetName || `NexLink-Update-${Date.now()}.exe`;
@@ -390,20 +500,28 @@ export class UpdateService {
         updateInfo: this.latestUpdateInfo || undefined,
       });
 
-      const fetchFn = (Electron.net?.fetch as typeof fetch) || globalThis.fetch;
-      const response = await fetchFn(targetUrl, {
-        headers: {
-          'User-Agent': 'NexLink-Desktop-Client',
+      const response = await fetchWithSafeRedirects(
+        targetUrl,
+        {
+          headers: {
+            'User-Agent': 'NexLink-Desktop-Client',
+          },
+          signal: this.abortController.signal,
         },
-        signal: this.abortController.signal,
-      });
+        { fetchFn: downloadOptions?.fetchFn, validateUrl }
+      );
 
       if (!response.ok) {
         throw new Error(`下载更新文件失败: HTTP ${response.status} ${response.statusText}`);
       }
 
-      const totalBytes =
-        Number(response.headers.get('content-length')) || this.latestUpdateInfo?.assetSize || 0;
+      const contentLength = Number(response.headers.get('content-length') || 0);
+      if (contentLength > maxBytes) {
+        await response.body?.cancel().catch(() => {});
+        throw new Error(`更新包体积 (${Math.round(contentLength / 1024 / 1024)}MB) 超过安全上限`);
+      }
+
+      const totalBytes = contentLength || this.latestUpdateInfo?.assetSize || 0;
       const fileStream = fs.createWriteStream(tempFilePath);
       let streamError: Error | null = null;
       fileStream.on('error', (err) => {
@@ -427,6 +545,12 @@ export class UpdateService {
 
         if (streamError) throw streamError;
         const buffer = Buffer.from(value);
+        transferred += buffer.length;
+        if (transferred > maxBytes) {
+          await reader.cancel().catch(() => {});
+          fileStream.destroy();
+          throw new Error('更新包下载体积超过安全上限，已主动中止');
+        }
         if (!fileStream.write(buffer)) {
           await new Promise<void>((resolve, reject) => {
             fileStream.once('drain', resolve);
@@ -434,7 +558,6 @@ export class UpdateService {
           });
         }
         sha256Hash.update(buffer);
-        transferred += buffer.length;
 
         const now = Date.now();
         if (now - lastTime >= 400) {
@@ -461,30 +584,25 @@ export class UpdateService {
         fileStream.on('error', reject);
       });
 
-      // 计算下载所得文件的真实 SHA256 哈希
+      // 计算下载所得文件的真实 SHA256 哈希并强制比对 expectedSha256 (Fail-Closed)
       const actualSha256 = sha256Hash.digest('hex').toLowerCase();
-
-      // 安装包完整性强校验：若 Release 提供了 expectedSha256，严格校验是否完全一致
-      const expectedSha256 = this.latestUpdateInfo?.expectedSha256?.toLowerCase();
-      if (expectedSha256) {
-        if (actualSha256 !== expectedSha256) {
-          try {
-            if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-          } catch (_e) {
-            void _e;
-          }
-          this.downloadedFilePath = null;
-          this.downloadedFileVerified = false;
-          this.isDownloading = false;
-
-          const hashMismatchError = `更新包完整性校验失败：文件 SHA256 散列值不匹配 (预期: ${expectedSha256.slice(0, 10)}..., 实际: ${actualSha256.slice(0, 10)}...)，文件可能已损坏或遭遇恶意篡改。`;
-          onProgress?.({
-            status: 'error',
-            error: hashMismatchError,
-            updateInfo: this.latestUpdateInfo || undefined,
-          });
-          return { success: false, error: hashMismatchError };
+      if (actualSha256 !== expectedSha256) {
+        try {
+          if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+        } catch (_e) {
+          void _e;
         }
+        this.downloadedFilePath = null;
+        this.downloadedFileVerified = false;
+        this.isDownloading = false;
+
+        const hashMismatchError = `更新包完整性校验失败：文件 SHA256 散列值不匹配 (预期: ${expectedSha256.slice(0, 10)}..., 实际: ${actualSha256.slice(0, 10)}...)，文件可能已损坏或遭遇恶意篡改。`;
+        onProgress?.({
+          status: 'error',
+          error: hashMismatchError,
+          updateInfo: this.latestUpdateInfo || undefined,
+        });
+        return { success: false, error: hashMismatchError };
       }
 
       // 校验通过，锁定受信任的下载包路径
@@ -556,14 +674,17 @@ export class UpdateService {
     }
 
     try {
-      // 安装前复核 SHA256 防范 %TEMP% TOCTOU 替换
-      const recordedSha256 = this.latestUpdateInfo?.actualSha256?.toLowerCase();
-      if (recordedSha256) {
-        const currentSha256 = crypto.createHash('sha256').update(fs.readFileSync(targetPath)).digest('hex').toLowerCase();
-        if (currentSha256 !== recordedSha256) {
-          this.downloadedFileVerified = false;
-          return { success: false, error: '安装包在启动前发生变化，完整性复核失败，请重新下载' };
-        }
+      // 安装前复核 SHA256 防范 %TEMP% TOCTOU 替换，同时强制预期哈希存在且一致 (Fail-Closed)
+      const expectedSha256 = this.latestUpdateInfo?.expectedSha256?.trim().toLowerCase();
+      const recordedSha256 = this.latestUpdateInfo?.actualSha256?.trim().toLowerCase();
+      if (!expectedSha256 || !recordedSha256 || expectedSha256 !== recordedSha256) {
+        this.downloadedFileVerified = false;
+        return { success: false, error: '安装包缺少有效 SHA-256 校验记录，已拒绝安装' };
+      }
+      const currentSha256 = crypto.createHash('sha256').update(fs.readFileSync(targetPath)).digest('hex').toLowerCase();
+      if (currentSha256 !== recordedSha256) {
+        this.downloadedFileVerified = false;
+        return { success: false, error: '安装包在启动前发生变化，完整性复核失败，请重新下载' };
       }
       console.log(`[UpdateService] 准备安全启动更新包: ${targetPath}`);
 
@@ -710,6 +831,14 @@ export class UpdateService {
       try {
         const info = await this.checkUpdate();
         if (info.hasUpdate && !mainWindow.isDestroyed()) {
+          if (info.error || !info.downloadUrl || !info.expectedSha256) {
+            mainWindow.webContents.send(IPC_CHANNELS.APP_UPDATE_STATUS, {
+              status: 'error',
+              error: info.error || '未获取到官方 SHA-256 校验值，已暂停自动更新',
+              updateInfo: info,
+            });
+            return;
+          }
           console.log(`[UpdateService] 检测到新版本发布: v${info.latestVersion}，自动在后台静默下载安装包...`);
           mainWindow.webContents.send(IPC_CHANNELS.APP_UPDATE_STATUS, {
             status: 'available',
