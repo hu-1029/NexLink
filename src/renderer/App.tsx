@@ -1,13 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense } from 'react';
 import { Titlebar } from './layouts/Titlebar';
 import { Sidebar, type NavTab } from './layouts/Sidebar';
-import { DashboardPage } from './pages/dashboard/DashboardPage';
-import { SubscriptionsPage } from './pages/subscriptions/SubscriptionsPage';
-import { NodesPage } from './pages/nodes/NodesPage';
-import { ProfilesPage } from './pages/profiles/ProfilesPage';
-import { TestPage } from './pages/test/TestPage';
-import { SettingsPage } from './pages/settings/SettingsPage';
-import { LogsPage } from './pages/logs/LogsPage';
+import { ToastContainer, showToast } from './components/common/Toast';
+
+const DashboardPage = React.lazy(() => import('./pages/dashboard/DashboardPage').then((m) => ({ default: m.DashboardPage })));
+const SubscriptionsPage = React.lazy(() => import('./pages/subscriptions/SubscriptionsPage').then((m) => ({ default: m.SubscriptionsPage })));
+const NodesPage = React.lazy(() => import('./pages/nodes/NodesPage').then((m) => ({ default: m.NodesPage })));
+const ProfilesPage = React.lazy(() => import('./pages/profiles/ProfilesPage').then((m) => ({ default: m.ProfilesPage })));
+const TestPage = React.lazy(() => import('./pages/test/TestPage').then((m) => ({ default: m.TestPage })));
+const SettingsPage = React.lazy(() => import('./pages/settings/SettingsPage').then((m) => ({ default: m.SettingsPage })));
+const LogsPage = React.lazy(() => import('./pages/logs/LogsPage').then((m) => ({ default: m.LogsPage })));
 import { useProxyStore } from './store/useProxyStore';
 import { useProfileStore } from './store/useProfileStore';
 import { Modal } from './components/common/Modal';
@@ -123,7 +125,17 @@ export const App: React.FC = () => {
       });
 
       const unsubStatus = window.nexlinkAPI.core.onStatus((status) => {
-        setCoreStatus(status);
+        setCoreStatus((prev) => {
+          if (status.error && status.error !== prev.error) {
+            showToast({
+              type: 'error',
+              title: '代理核心运行异常',
+              message: status.error,
+              durationMs: 6000,
+            });
+          }
+          return status;
+        });
       });
 
       // 启动自适应重查，确保冷启动阶段核心拉起后界面即时从未启动秒变为运行中
@@ -292,7 +304,11 @@ export const App: React.FC = () => {
         console.error('即时保存设置失败:', err);
         setSettings(snapshot);
         setSystemProxy(Boolean(snapshot.systemProxy));
-        alert(err?.message || '保存设置或热重载失败，已自动回滚原配置');
+        showToast({
+          type: 'error',
+          title: '设置保存失败',
+          message: err?.message || '保存设置或热重载失败，已自动回滚原配置',
+        });
       }
     }
   };
@@ -308,7 +324,13 @@ export const App: React.FC = () => {
         if (ok === false) {
           setSystemProxy(prev);
           setSettings((s) => ({ ...s, systemProxy: prev }));
-          if (next) alert('代理核心未运行，无法开启系统代理，请先启动核心。');
+          if (next) {
+            showToast({
+              type: 'warning',
+              title: '无法开启系统代理',
+              message: '代理核心尚未运行，请先启动核心后再开启系统代理。',
+            });
+          }
         }
       } catch (err: any) {
         setSystemProxy(prev);
@@ -348,14 +370,14 @@ export const App: React.FC = () => {
           selectedNodeName: resolveSelectedOutboundName(),
         });
         if (!res.success) {
-          alert(res.error || '核心启动失败');
+          showToast({ type: 'error', title: '核心启动失败', message: res.error || '请检查节点或端口配置' });
         } else {
           const status = await window.nexlinkAPI.core.getStatus();
           setCoreStatus(status);
         }
       }
     } catch (err: any) {
-      alert(err?.message || '核心操作异常');
+      showToast({ type: 'error', title: '核心操作异常', message: err?.message || '未知错误' });
     } finally {
       setIsCoreBusy(false);
     }
@@ -370,13 +392,14 @@ export const App: React.FC = () => {
         selectedNodeName: resolveSelectedOutboundName(),
       });
       if (!res.success) {
-        alert(res.error || '核心重启失败');
+        showToast({ type: 'error', title: '核心重启失败', message: res.error || '未知错误' });
       } else {
         const status = await window.nexlinkAPI.core.getStatus();
         setCoreStatus(status);
+        showToast({ type: 'success', title: '代理核心已重启', durationMs: 2500 });
       }
     } catch (err: any) {
-      alert(err?.message || '核心重启异常');
+      showToast({ type: 'error', title: '核心重启异常', message: err?.message || '未知错误' });
     } finally {
       setIsCoreBusy(false);
     }
@@ -416,54 +439,63 @@ export const App: React.FC = () => {
 
         {/* 右侧主视窗内容区 */}
         <main className="flex-1 h-[calc(100vh-2.5rem)] overflow-y-auto p-6">
-          {currentTab === 'dashboard' && (
-            <DashboardPage
-              coreStatus={coreStatus}
-              systemProxy={systemProxy}
-              settings={settings}
-              onToggleTun={handleToggleTun}
-              onUpdateSettings={handleUpdateSettings}
-              onToggleCore={handleToggleCore}
-              onToggleProxy={handleToggleSystemProxy}
-              onResetProxy={handleResetSystemProxy}
-              onNavigateToNodes={() => setCurrentTab('nodes')}
-              onNavigateToProfiles={() => setCurrentTab('profiles')}
-              onNavigateToTest={() => setCurrentTab('test')}
-              onRestartCore={handleRestartCore}
-              onChangeMode={handleSetMode}
-            />
-          )}
+          <Suspense
+            fallback={
+              <div className="flex items-center justify-center h-full text-slate-400">
+                <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+              </div>
+            }
+          >
+            {currentTab === 'dashboard' && (
+              <DashboardPage
+                coreStatus={coreStatus}
+                systemProxy={systemProxy}
+                settings={settings}
+                onToggleTun={handleToggleTun}
+                onUpdateSettings={handleUpdateSettings}
+                onToggleCore={handleToggleCore}
+                onToggleProxy={handleToggleSystemProxy}
+                onResetProxy={handleResetSystemProxy}
+                onNavigateToNodes={() => setCurrentTab('nodes')}
+                onNavigateToProfiles={() => setCurrentTab('profiles')}
+                onNavigateToTest={() => setCurrentTab('test')}
+                onRestartCore={handleRestartCore}
+                onChangeMode={handleSetMode}
+              />
+            )}
 
-          {((currentTab as any) === 'subscriptions' || (currentTab as any) === 'import') && (
-            <SubscriptionsPage />
-          )}
+            {((currentTab as any) === 'subscriptions' || (currentTab as any) === 'import') && (
+              <SubscriptionsPage />
+            )}
 
-          {currentTab === 'nodes' && <NodesPage />}
+            {currentTab === 'nodes' && <NodesPage />}
 
-          {currentTab === 'profiles' && <ProfilesPage />}
+            {currentTab === 'profiles' && <ProfilesPage />}
 
-          {currentTab === 'test' && <TestPage />}
+            {currentTab === 'test' && <TestPage />}
 
-          {currentTab === 'logs' && <LogsPage />}
+            {currentTab === 'logs' && <LogsPage />}
 
-          {currentTab === 'settings' && (
-            <SettingsPage
-              theme={theme}
-              onToggleTheme={handleToggleTheme}
-              onSelectTheme={handleSetTheme}
-              systemProxy={systemProxy}
-              onToggleProxy={handleToggleSystemProxy}
-              coreRunning={coreStatus.running}
-              onToggleCore={handleToggleCore}
-              onRestartCore={handleRestartCore}
-              settings={settings}
-              appVersion={appInfo?.version}
-              coreVersion={coreStatus.version}
-              onToggleTun={handleToggleTun}
-              onUpdateSettings={handleUpdateSettings}
-            />
-          )}
+            {currentTab === 'settings' && (
+              <SettingsPage
+                theme={theme}
+                onToggleTheme={handleToggleTheme}
+                onSelectTheme={handleSetTheme}
+                systemProxy={systemProxy}
+                onToggleProxy={handleToggleSystemProxy}
+                coreRunning={coreStatus.running}
+                onToggleCore={handleToggleCore}
+                onRestartCore={handleRestartCore}
+                settings={settings}
+                appVersion={appInfo?.version}
+                coreVersion={coreStatus.version}
+                onToggleTun={handleToggleTun}
+                onUpdateSettings={handleUpdateSettings}
+              />
+            )}
+          </Suspense>
         </main>
+        <ToastContainer />
 
         {/* 自动更新就绪全局弹窗 (后台静默下载完成后弹出询问用户是否立即安装) */}
         <Modal
