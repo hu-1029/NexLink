@@ -80,6 +80,22 @@ describe('Windows 真实 ACL 链校验专项测试 (不注入任何假结果/Moc
         'S-1-5-32-545',
         '不安全的 SID 必须精准识别为 BUILTIN\\Users (S-1-5-32-545)'
       );
+
+      // 阶段 4 (P0-1)：即使 DACL 仅允许 Users RX，只要 NTFS Owner 为非特权 SID (Users)，仍必须判定为不安全！
+      execFileSync('icacls.exe', [testFile, '/remove', 'Users', '/Q']);
+      execFileSync('icacls.exe', [testFile, '/grant', 'Users:RX', '/Q']);
+      execFileSync('icacls.exe', [testFile, '/setowner', 'Users', '/Q']);
+      const unsafeOwnerResult = verifyWindowsPathAclChainSync(testFile);
+      assert.equal(
+        unsafeOwnerResult.locked,
+        false,
+        `NTFS Owner 为普通用户 (Users) 时即使 DACL 锁定也必须判定为不安全，实际结果: ${JSON.stringify(unsafeOwnerResult)}`
+      );
+      assert.equal(
+        unsafeOwnerResult.unsafeSid,
+        'S-1-5-32-545',
+        '不安全 Owner SID 必须识别为 S-1-5-32-545'
+      );
     } finally {
       if (fs.existsSync(testDir)) {
         try {

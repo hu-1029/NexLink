@@ -63,6 +63,23 @@ function encodePowerShellCommand(script: string): string {
 
 export const TRUSTED_MIHOMO_MANIFEST_FILENAME = 'mihomo-manifest.json';
 
+export const ALLOWED_RULE_EXTENSIONS = new Set<string>([
+  '.mrs',
+  '.dat',
+  '.mmdb',
+  '.metadb',
+  '.yaml',
+  '.yml',
+  '.list',
+  '.txt',
+]);
+
+export function isAllowedRuleFileName(fileName: string): boolean {
+  if (!fileName || typeof fileName !== 'string') return false;
+  const ext = path.extname(fileName.trim()).toLowerCase();
+  return ALLOWED_RULE_EXTENSIONS.has(ext);
+}
+
 export const TRUSTED_WRITE_SIDS = new Set<string>([
   'S-1-5-18', // NT AUTHORITY\SYSTEM
   'S-1-5-32-544', // BUILTIN\Administrators
@@ -165,6 +182,10 @@ export function verifyWindowsPathAclChainSync(targetPath: string): AclCheckResul
     "    if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { [PSCustomObject]@{ locked=$false; reason='Reparse point detected'; unsafePath=$cur } | ConvertTo-Json -Compress; exit 0 }",
     "    if ($programData -and [string]::Equals($cur, $programData, [System.StringComparison]::OrdinalIgnoreCase)) { break }",
     "    $acl = Get-Acl -LiteralPath $cur",
+    "    $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+    "    if ($trusted -notcontains $ownerSid) {",
+    "        [PSCustomObject]@{ locked=$false; reason='Untrusted NTFS owner SID'; unsafePath=$cur; unsafeSid=$ownerSid } | ConvertTo-Json -Compress; exit 0",
+    "    }",
     "    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {",
     "        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }",
     "        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }",
@@ -402,6 +423,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 
@@ -417,6 +439,8 @@ namespace NexLinkServiceHost
         private readonly object _coreLogLock = new object();
         private Process _coreProcess = null;
         private StreamWriter _coreLogWriter = null;
+        private long _coreLogBytesWritten = 0;
+        private const long MaxCoreLogBytes = 5 * 1024 * 1024;
         private string _authToken = "";
         private bool _tunWasEnabled = false;
         private readonly string _serviceDir;
@@ -521,6 +545,12 @@ namespace NexLinkServiceHost
             }
             VerifyNotReparsePointChain(dirPath);
             DirectorySecurity ds = Directory.GetAccessControl(dirPath);
+            IdentityReference ownerRef = ds.GetOwner(typeof(SecurityIdentifier));
+            string ownerSid = ownerRef != null ? ownerRef.Value : "";
+            if (!TrustedWriteSids.Contains(ownerSid))
+            {
+                throw new UnauthorizedAccessException("Directory owner unsafe (untrusted owner SID " + ownerSid + "): " + dirPath);
+            }
             AuthorizationRuleCollection rules = ds.GetAccessRules(true, true, typeof(SecurityIdentifier));
             FileSystemRights dangerousRights =
                 FileSystemRights.WriteData |
@@ -554,6 +584,12 @@ namespace NexLinkServiceHost
             }
             VerifyNotReparsePointChain(filePath);
             FileSecurity fs = File.GetAccessControl(filePath);
+            IdentityReference ownerRef = fs.GetOwner(typeof(SecurityIdentifier));
+            string ownerSid = ownerRef != null ? ownerRef.Value : "";
+            if (!TrustedWriteSids.Contains(ownerSid))
+            {
+                throw new UnauthorizedAccessException("File owner unsafe (untrusted owner SID " + ownerSid + "): " + filePath);
+            }
             AuthorizationRuleCollection rules = fs.GetAccessRules(true, true, typeof(SecurityIdentifier));
             FileSystemRights dangerousRights =
                 FileSystemRights.WriteData |
@@ -788,6 +824,143 @@ namespace NexLinkServiceHost
             catch { }
         }
 
+        private static bool ConstantTimeEquals(string a, string b)
+        {
+            if (a == null || b == null) return false;
+            byte[] ba = Encoding.UTF8.GetBytes(a);
+            byte[] bb = Encoding.UTF8.GetBytes(b);
+            int diff = ba.Length ^ bb.Length;
+            int maxLen = Math.Max(ba.Length, bb.Length);
+            for (int i = 0; i < maxLen; i++)
+            {
+                byte x = i < ba.Length ? ba[i] : (byte)0;
+                byte y = i < bb.Length ? bb[i] : (byte)0;
+                diff |= (x ^ y);
+            }
+            return diff == 0;
+        }
+
+        private static void ValidateConfigContentSafety(string configContent)
+        {
+            if (Regex.IsMatch(configContent, @"^\\s*external-controller-(tls|unix|pipe)\\s*:", RegexOptions.IgnoreCase | RegexOptions.Multiline))
+            {
+                throw new UnauthorizedAccessException("Unsupported external-controller transport rejected by service");
+            }
+            MatchCollection matches = Regex.Matches(configContent, @"^\\s*external-controller\\s*:\\s*(.+)$", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+            foreach (Match m in matches)
+            {
+                string rawVal = m.Groups[1].Value;
+                rawVal = Regex.Replace(rawVal, @"\\s+#.*$", "").Trim();
+                if ((rawVal.StartsWith("'") && rawVal.EndsWith("'")) || (rawVal.StartsWith("\\"") && rawVal.EndsWith("\\"")))
+                {
+                    if (rawVal.Length >= 2) rawVal = rawVal.Substring(1, rawVal.Length - 2).Trim();
+                }
+                if (string.IsNullOrEmpty(rawVal)) continue;
+                Match hostPort = Regex.Match(rawVal, @"^(127\\.0\\.0\\.1|localhost|\\[::1\\]):([1-9]\\d{0,4})$", RegexOptions.IgnoreCase);
+                if (!hostPort.Success)
+                {
+                    throw new UnauthorizedAccessException("external-controller must bind strictly to loopback (127.0.0.1): " + rawVal);
+                }
+                int ctlPort;
+                if (!int.TryParse(hostPort.Groups[2].Value, out ctlPort) || ctlPort < 1 || ctlPort > 65535)
+                {
+                    throw new UnauthorizedAccessException("Invalid external-controller port: " + rawVal);
+                }
+            }
+        }
+
+        private static bool IsTunEnabledInYaml(string configContent)
+        {
+            if (string.IsNullOrEmpty(configContent)) return false;
+            bool inTunSection = false;
+            using (var sr = new StringReader(configContent))
+            {
+                string rawLine;
+                while ((rawLine = sr.ReadLine()) != null)
+                {
+                    string trimmed = rawLine.Trim();
+                    if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("#")) continue;
+                    bool isTopLevel = rawLine.Length > 0 && !char.IsWhiteSpace(rawLine[0]) && !trimmed.StartsWith("-");
+                    if (isTopLevel)
+                    {
+                        if (Regex.IsMatch(trimmed, @"^tun\\s*:\\s*(#.*)?$", RegexOptions.IgnoreCase))
+                        {
+                            inTunSection = true;
+                            continue;
+                        }
+                        if (Regex.IsMatch(trimmed, @"^tun\\s*:\\s*\\{.*\\}", RegexOptions.IgnoreCase))
+                        {
+                            if (Regex.IsMatch(trimmed, @"\\benable\\s*:\\s*true\\b", RegexOptions.IgnoreCase)) return true;
+                            inTunSection = false;
+                            continue;
+                        }
+                        inTunSection = false;
+                        continue;
+                    }
+                    if (inTunSection)
+                    {
+                        string noComment = Regex.Replace(trimmed, @"\\s+#.*$", "").Trim();
+                        if (Regex.IsMatch(noComment, @"^enable\\s*:\\s*true$", RegexOptions.IgnoreCase)) return true;
+                        if (Regex.IsMatch(noComment, @"^enable\\s*:\\s*false$", RegexOptions.IgnoreCase)) return false;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private void RotateCoreLogLockedIfNeeded(long incomingBytes)
+        {
+            if (string.IsNullOrEmpty(_lockedCoreLogPath)) return;
+            if (_coreLogBytesWritten + incomingBytes < MaxCoreLogBytes) return;
+            if (_coreLogWriter != null)
+            {
+                try { _coreLogWriter.Flush(); _coreLogWriter.Close(); _coreLogWriter.Dispose(); } catch { }
+                _coreLogWriter = null;
+            }
+            string backupLog = _lockedCoreLogPath + ".1";
+            try
+            {
+                if (File.Exists(backupLog)) File.Delete(backupLog);
+                if (File.Exists(_lockedCoreLogPath)) File.Move(_lockedCoreLogPath, backupLog);
+            }
+            catch
+            {
+                try { File.WriteAllText(_lockedCoreLogPath, "", Encoding.UTF8); } catch { }
+            }
+            _coreLogBytesWritten = 0;
+            try
+            {
+                _coreLogWriter = new StreamWriter(
+                    new FileStream(_lockedCoreLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
+                    Encoding.UTF8
+                )
+                {
+                    AutoFlush = true
+                };
+            }
+            catch { _coreLogWriter = null; }
+        }
+
+        private void WriteCoreLogLine(string line)
+        {
+            if (line == null) return;
+            lock (_coreLogLock)
+            {
+                if (_coreLogWriter == null) return;
+                try
+                {
+                    long bytes = Encoding.UTF8.GetByteCount(line) + 2;
+                    RotateCoreLogLockedIfNeeded(bytes);
+                    if (_coreLogWriter != null)
+                    {
+                        _coreLogWriter.WriteLine(line);
+                        _coreLogBytesWritten += bytes;
+                    }
+                }
+                catch { }
+            }
+        }
+
         private void HandleRequest(HttpListenerContext ctx)
         {
             HttpListenerRequest req = ctx.Request;
@@ -796,7 +969,7 @@ namespace NexLinkServiceHost
             try
             {
                 string token = req.Headers["X-NexLink-Token"] ?? "";
-                if (string.IsNullOrEmpty(_authToken) || !string.Equals(token, _authToken, StringComparison.Ordinal))
+                if (string.IsNullOrEmpty(_authToken) || !ConstantTimeEquals(token, _authToken))
                 {
                     WriteJson(res, 403, new { ok = false, error = "Forbidden: invalid service token" });
                     return;
@@ -918,15 +1091,14 @@ namespace NexLinkServiceHost
                 }
                 VerifyTrustedMihomoSource(_lockedBinPath, actualBinHash);
 
-                // 2. Write configContent atomically into locked runtime dir (never trust user-writable configDir)
+                // 2. Validate configContent loopback controller & write atomically into locked runtime dir (never trust user-writable configDir)
+                ValidateConfigContentSafety(configContent);
                 string tmpCfg = _lockedConfigPath + ".tmp";
                 File.WriteAllText(tmpCfg, configContent, new UTF8Encoding(false));
                 if (File.Exists(_lockedConfigPath)) File.Delete(_lockedConfigPath);
                 File.Move(tmpCfg, _lockedConfigPath);
 
-                bool configUsesTun =
-                    configContent.IndexOf("tun:", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                    configContent.IndexOf("enable: true", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool configUsesTun = IsTunEnabledInYaml(configContent);
 
                 // 3. Verify no untrusted DLLs exist in locked bin/runtime dirs and verify wintun.dll SHA-256
                 VerifyDirectoryDlls(_lockedBinDir, false);
@@ -954,18 +1126,40 @@ namespace NexLinkServiceHost
 
                 if (!string.IsNullOrEmpty(_lockedCoreLogPath))
                 {
-                    try
+                    lock (_coreLogLock)
                     {
-                        _coreLogWriter = new StreamWriter(
-                            new FileStream(_lockedCoreLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
-                            Encoding.UTF8
-                        )
+                        try
                         {
-                            AutoFlush = true
-                        };
-                        _coreLogWriter.WriteLine(Environment.NewLine + "--- NexLink Service Mihomo Core Starting at " + DateTime.UtcNow.ToString("o") + " ---");
+                            if (File.Exists(_lockedCoreLogPath))
+                            {
+                                long existingLen = new FileInfo(_lockedCoreLogPath).Length;
+                                if (existingLen >= MaxCoreLogBytes)
+                                {
+                                    string backupLog = _lockedCoreLogPath + ".1";
+                                    if (File.Exists(backupLog)) File.Delete(backupLog);
+                                    File.Move(_lockedCoreLogPath, backupLog);
+                                    _coreLogBytesWritten = 0;
+                                }
+                                else
+                                {
+                                    _coreLogBytesWritten = existingLen;
+                                }
+                            }
+                            else
+                            {
+                                _coreLogBytesWritten = 0;
+                            }
+                            _coreLogWriter = new StreamWriter(
+                                new FileStream(_lockedCoreLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite),
+                                Encoding.UTF8
+                            )
+                            {
+                                AutoFlush = true
+                            };
+                        }
+                        catch { _coreLogWriter = null; }
                     }
-                    catch { _coreLogWriter = null; }
+                    WriteCoreLogLine(Environment.NewLine + "--- NexLink Service Mihomo Core Starting at " + DateTime.UtcNow.ToString("o") + " ---");
                 }
 
                 var proc = new Process { StartInfo = psi, EnableRaisingEvents = true };
@@ -973,20 +1167,14 @@ namespace NexLinkServiceHost
                 {
                     if (e.Data != null)
                     {
-                        lock (_coreLogLock)
-                        {
-                            if (_coreLogWriter != null) { try { _coreLogWriter.WriteLine(e.Data); } catch { } }
-                        }
+                        WriteCoreLogLine(e.Data);
                     }
                 };
                 proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
                     if (e.Data != null)
                     {
-                        lock (_coreLogLock)
-                        {
-                            if (_coreLogWriter != null) { try { _coreLogWriter.WriteLine(e.Data); } catch { } }
-                        }
+                        WriteCoreLogLine(e.Data);
                     }
                 };
 
@@ -1334,9 +1522,25 @@ export class TunServiceManager {
         "    return @{ Code = $p.ExitCode; Output = ($out + ' ' + $err).Trim() }",
         "}",
         "",
+        "function Assert-NoReparseChain([string]$target) {",
+        "    $cur = $target.TrimEnd('\\', '/')",
+        "    $root = [System.IO.Path]::GetPathRoot($cur)",
+        "    while ($cur -and ($cur -ne $root)) {",
+        "        if (Test-Path -LiteralPath $cur) {",
+        "            $it = Get-Item -LiteralPath $cur -Force",
+        "            if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw ('Refusing reparse point in path chain: ' + $cur) }",
+        "        }",
+        "        $parent = [System.IO.Path]::GetDirectoryName($cur)",
+        "        if (-not $parent -or $parent -eq $cur) { break }",
+        "        $cur = $parent",
+        "    }",
+        "}",
+        "",
         "Write-Result 'STEP:INIT'",
         "try {",
+        "    Assert-NoReparseChain $serviceDir",
         "    New-Item -ItemType Directory -Force -Path $serviceDir | Out-Null",
+        "    Assert-NoReparseChain $serviceDir",
         "",
         "    # Step 1: Locate Windows built-in .NET Framework 4.x csc.exe",
         "    $fwCandidates = @(",
@@ -1372,34 +1576,27 @@ export class TunServiceManager {
         "        }",
         "    }",
         "",
-        "    # Step 3: Reject reparse points (junction/symlink), create locked bin/runtime dirs, enforce ACL with strict exit code checks",
+        "    # Step 3: Reject reparse points (junction/symlink), create locked bin/runtime dirs, enforce owner & ACL with strict exit code checks",
         "    Write-Result 'STEP:TOKEN'",
-        "    function Assert-NoReparseChain([string]$target) {",
-        "        $cur = $target.TrimEnd('\\', '/')",
-        "        $root = [System.IO.Path]::GetPathRoot($cur)",
-        "        while ($cur -and ($cur -ne $root)) {",
-        "            if (Test-Path -LiteralPath $cur) {",
-        "                $it = Get-Item -LiteralPath $cur -Force",
-        "                if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw ('Refusing reparse point in path chain: ' + $cur) }",
-        "            }",
-        "            $parent = [System.IO.Path]::GetDirectoryName($cur)",
-        "            if (-not $parent -or $parent -eq $cur) { break }",
-        "            $cur = $parent",
-        "        }",
-        "    }",
         "    Assert-NoReparseChain $runtimeDir",
         "    Assert-NoReparseChain $binDir",
         "    New-Item -ItemType Directory -Force -Path $binDir | Out-Null",
         "    New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null",
-        "    Assert-NoReparseChain $runtimeDir",
-        "    Assert-NoReparseChain $binDir",
         "    if ($appParentDir -and (Test-Path -LiteralPath $appParentDir)) {",
+        "        $ownParentRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "        if ($ownParentRes.Code -ne 0) { throw ('icacls parent directory owner lock failed (code ' + $ownParentRes.Code + '): ' + $ownParentRes.Output) }",
         "        $aclParentRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /Q')",
         "        if ($aclParentRes.Code -ne 0) { throw ('icacls parent directory ACL lock failed (code ' + $aclParentRes.Code + '): ' + $aclParentRes.Output) }",
         "    }",
+        "    $ownDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "    if ($ownDirRes.Code -ne 0) { throw ('icacls directory owner lock failed (code ' + $ownDirRes.Code + '): ' + $ownDirRes.Output) }",
         "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /Q')",
         "    if ($aclDirRes.Code -ne 0) { throw ('icacls directory ACL lock failed (code ' + $aclDirRes.Code + '): ' + $aclDirRes.Output) }",
+        "    Assert-NoReparseChain $runtimeDir",
+        "    Assert-NoReparseChain $binDir",
         "    if (Test-Path -LiteralPath ($serviceDir + '\\*')) {",
+        "        $ownSubRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /setowner \"*S-1-5-32-544\" /T /Q')",
+        "        if ($ownSubRes.Code -ne 0) { throw ('icacls subitem owner lock failed (code ' + $ownSubRes.Code + '): ' + $ownSubRes.Output) }",
         "        $aclSubRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /T /Q')",
         "        if ($aclSubRes.Code -ne 0) { throw ('icacls subitem ACL lock failed (code ' + $aclSubRes.Code + '): ' + $aclSubRes.Output) }",
         "    }",
@@ -1413,6 +1610,8 @@ export class TunServiceManager {
         "            if (-not (Test-Path -LiteralPath $cur)) { throw ('Install source path missing: ' + $cur) }",
         "            if ($programData -and [string]::Equals($cur, $programData, [System.StringComparison]::OrdinalIgnoreCase)) { break }",
         "            $acl = Get-Acl -LiteralPath $cur",
+        "            $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
+        "            if ($trustedSids -notcontains $ownerSid) { throw ('Install source owner unsafe (untrusted owner SID ' + $ownerSid + '): ' + $cur) }",
         "            foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {",
         "                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }",
         "                if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }",
@@ -1465,13 +1664,19 @@ export class TunServiceManager {
         "    $srcBinDir = Split-Path -Parent $trustedBin",
         "    $srcWintun = Join-Path $srcBinDir 'wintun.dll'",
         "    if (Test-Path -LiteralPath $srcWintun) {",
-        "        $wHash = (Get-FileHash -LiteralPath $srcWintun -Algorithm SHA256).Hash.ToUpperInvariant()",
-        "        $validWintun = @('E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE','F7BA89005544BE9D85231A9E0D5F23B2D15B3311667E2DAD0DEBD344918A3F80','D694FA46AB4CFEBCB2632D094C7AA97278EEF2F8052438621766D863AE98A931','DAAD267411ECDC70A0535E274D2C3E9DA3D0084BDAC7662CB8424DD4A031B4D9')",
-        "        if ($validWintun -notcontains $wHash) { throw ('wintun.dll SHA-256 mismatch: ' + $wHash) }",
+        "        Assert-NoReparseChain $srcWintun",
+        "        if (Test-Path -LiteralPath $lockedWintunPath) { Remove-Item -LiteralPath $lockedWintunPath -Force -ErrorAction SilentlyContinue }",
         "        Copy-Item -LiteralPath $srcWintun -Destination $lockedWintunPath -Force",
+        "        $wHash = (Get-FileHash -LiteralPath $lockedWintunPath -Algorithm SHA256).Hash.ToUpperInvariant()",
+        "        $validWintun = @('E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE','F7BA89005544BE9D85231A9E0D5F23B2D15B3311667E2DAD0DEBD344918A3F80','D694FA46AB4CFEBCB2632D094C7AA97278EEF2F8052438621766D863AE98A931','DAAD267411ECDC70A0535E274D2C3E9DA3D0084BDAC7662CB8424DD4A031B4D9')",
+        "        if ($validWintun -notcontains $wHash) { Remove-Item -LiteralPath $lockedWintunPath -Force -ErrorAction SilentlyContinue; throw ('wintun.dll SHA-256 mismatch: ' + $wHash) }",
         "    }",
+        "    $allowedRuleExts = @('.mrs', '.dat', '.mmdb', '.metadb', '.yaml', '.yml', '.list', '.txt')",
         "    $srcRulesDir = Join-Path (Split-Path -Parent $srcBinDir) 'rules'",
-        "    if (Test-Path -LiteralPath $srcRulesDir) { Get-ChildItem -LiteralPath $srcRulesDir -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $runtimeDir $_.Name) -Force } }",
+        "    if (Test-Path -LiteralPath $srcRulesDir) {",
+        "        Assert-NoReparseChain $srcRulesDir",
+        "        Get-ChildItem -LiteralPath $srcRulesDir -File | Where-Object { (-not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) -and ($allowedRuleExts -contains $_.Extension.ToLowerInvariant()) } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $runtimeDir $_.Name) -Force }",
+        "    }",
         "    [System.IO.File]::WriteAllText($tokenPath, $tokenValue, $utf8NoBom)",
         "    if (-not $tokenReader) { throw 'Cannot determine current user principal for service.token ACL' }",
         "    $aclTokRes = Run-Native 'icacls.exe' ('\"' + $tokenPath + '\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" /grant:r \"*S-1-5-32-544:(F)\" /grant:r \"' + $tokenReader + ':(R)\" /Q')",
@@ -1487,6 +1692,8 @@ export class TunServiceManager {
         "    if ($cRes.Code -ne 0 -or -not (Test-Path $exePath)) {",
         "        throw ('csc.exe compile failed (code ' + $cRes.Code + '): ' + $cRes.Output)",
         "    }",
+        "    $aclPostOwnerRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /setowner \"*S-1-5-32-544\" /T /Q')",
+        "    if ($aclPostOwnerRes.Code -ne 0) { throw ('icacls subitem owner lock failed (code ' + $aclPostOwnerRes.Code + '): ' + $aclPostOwnerRes.Output) }",
         "",
         "    # Step 5: Register Windows Service (LocalSystem, auto-start)",
         "    Write-Result 'STEP:REGISTER'",
@@ -1726,15 +1933,35 @@ export class TunServiceManager {
     newBinPath: string,
     version: string,
     expectedSha256: string,
-    isAlreadyAdmin: boolean
+    isAlreadyAdmin: boolean,
+    sourceOptions?: VerifyMihomoSourceOptions
   ): Promise<{ success: boolean; serviceRestarted?: boolean; error?: string }> {
     if (process.platform !== 'win32') {
       return { success: false, error: '仅 Windows 支持同步特权服务核心指纹' };
+    }
+    const normalizedVersion = (version || '').trim();
+    if (!/^v?\d+\.\d+\.\d+([-.][a-zA-Z0-9._]+)?$/.test(normalizedVersion)) {
+      return { success: false, error: '无效的版本号格式，拒绝同步特权服务核心指纹' };
     }
     const resolvedBin = path.resolve(newBinPath);
     const normalizedHash = (expectedSha256 || '').trim().toUpperCase();
     if (!fs.existsSync(resolvedBin) || !/^[A-F0-9]{64}$/.test(normalizedHash)) {
       return { success: false, error: '无效的新内核路径或 SHA-256 指纹' };
+    }
+
+    // 强制校验新内核安装源可信性（与 installService 同口径：文件名/非符号链接/PE头/ACL或数字签名或可信清单），绝不允许将任意不可信二进制写入 SYSTEM 清单
+    const trustRes = verifyMihomoInstallSource(resolvedBin, sourceOptions);
+    if (!trustRes.trusted || !trustRes.sha256) {
+      return {
+        success: false,
+        error: trustRes.error || '新内核未通过可信来源验证，拒绝同步至特权服务清单',
+      };
+    }
+    if (trustRes.sha256.toUpperCase() !== normalizedHash) {
+      return {
+        success: false,
+        error: '新内核文件实际 SHA-256 与预期指纹不一致，拒绝同步',
+      };
     }
 
     const tmpDir = path.join(os.tmpdir(), `nexlink-core-sync-${Date.now()}`);
@@ -1745,7 +1972,7 @@ export class TunServiceManager {
       fs.mkdirSync(tmpDir, { recursive: true });
       const escapedServiceDir = this.serviceDir.replace(/'/g, "''");
       const escapedNewBin = resolvedBin.replace(/'/g, "''");
-      const escapedVersion = (version || 'custom').replace(/'/g, "''");
+      const escapedVersion = normalizedVersion.replace(/'/g, "''");
       const escapedResultLog = resultLogPath.replace(/'/g, "''");
       const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
 
@@ -1768,6 +1995,19 @@ export class TunServiceManager {
         "$persistentManifestPath = Join-Path $appParentDir 'mihomo-manifest.json'",
         "$lockedManifestPath = Join-Path $serviceDir 'mihomo-manifest.json'",
         "function Write-Result([string]$msg) { [System.IO.File]::WriteAllText($resultLog, $msg, $utf8NoBom) }",
+        "function Assert-NoReparseChain([string]$target) {",
+        "    $cur = $target.TrimEnd('\\', '/')",
+        "    $root = [System.IO.Path]::GetPathRoot($cur)",
+        "    while ($cur -and ($cur -ne $root)) {",
+        "        if (Test-Path -LiteralPath $cur) {",
+        "            $it = Get-Item -LiteralPath $cur -Force",
+        "            if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw ('Refusing reparse point in path chain: ' + $cur) }",
+        "        }",
+        "        $parent = [System.IO.Path]::GetDirectoryName($cur)",
+        "        if (-not $parent -or $parent -eq $cur) { break }",
+        "        $cur = $parent",
+        "    }",
+        "}",
         "function Run-Native([string]$exe, [string]$argLine) {",
         "    $psi = New-Object System.Diagnostics.ProcessStartInfo",
         "    $psi.FileName = $exe",
@@ -1783,14 +2023,24 @@ export class TunServiceManager {
         "    return @{ Code = $p.ExitCode; Output = ($out + \"`n\" + $err).Trim() }",
         "}",
         "try {",
+        "    Assert-NoReparseChain $newBin",
+        "    Assert-NoReparseChain $serviceDir",
+        "    Assert-NoReparseChain $binDir",
+        "    Assert-NoReparseChain $runtimeDir",
         "    if (-not (Test-Path -LiteralPath $appParentDir)) { New-Item -ItemType Directory -Path $appParentDir -Force | Out-Null }",
         "    if (-not (Test-Path -LiteralPath $serviceDir)) { New-Item -ItemType Directory -Path $serviceDir -Force | Out-Null }",
         "    if (-not (Test-Path -LiteralPath $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }",
         "    if (-not (Test-Path -LiteralPath $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }",
+        "    $ownAppRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "    if ($ownAppRes.Code -ne 0) { throw ('icacls appParentDir owner lock failed: ' + $ownAppRes.Output) }",
         "    $aclAppRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /Q')",
         "    if ($aclAppRes.Code -ne 0) { throw ('icacls appParentDir lock failed: ' + $aclAppRes.Output) }",
+        "    $ownDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "    if ($ownDirRes.Code -ne 0) { throw ('icacls serviceDir owner lock failed: ' + $ownDirRes.Output) }",
         "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /Q')",
         "    if ($aclDirRes.Code -ne 0) { throw ('icacls serviceDir lock failed: ' + $aclDirRes.Output) }",
+        "    Assert-NoReparseChain $binDir",
+        "    Assert-NoReparseChain $runtimeDir",
         "    $entriesList = New-Object System.Collections.ArrayList",
         "    $readManifestSrc = $null",
         "    if (Test-Path -LiteralPath $persistentManifestPath) { $readManifestSrc = $persistentManifestPath }",
@@ -1810,6 +2060,8 @@ export class TunServiceManager {
         "    [void]$entriesList.Add(@{ version = $coreVer; arch = $coreArch; sha256 = $expectedHash })",
         "    $manifestJson = (@{ schemaVersion = 1; entries = $entriesList } | ConvertTo-Json -Depth 4)",
         "    [System.IO.File]::WriteAllText($persistentManifestPath, $manifestJson, $utf8NoBom)",
+        "    $ownPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "    if ($ownPmRes.Code -ne 0) { throw ('icacls persistent manifest owner lock failed: ' + $ownPmRes.Output) }",
         "    $aclPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /Q')",
         "    if ($aclPmRes.Code -ne 0) { throw ('icacls persistent manifest lock failed: ' + $aclPmRes.Output) }",
         "    [System.IO.File]::WriteAllText($lockedManifestPath, $manifestJson, $utf8NoBom)",
@@ -1836,6 +2088,8 @@ export class TunServiceManager {
         "        }",
         "    }",
         "    if (Test-Path -LiteralPath ($serviceDir + '\\*')) {",
+        "        $ownSubRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /setowner \"*S-1-5-32-544\" /T /Q')",
+        "        if ($ownSubRes.Code -ne 0) { throw ('icacls subitem owner lock failed: ' + $ownSubRes.Output) }",
         "        $aclSubRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /T /Q')",
         "        if ($aclSubRes.Code -ne 0) { throw ('icacls subitem lock failed: ' + $aclSubRes.Output) }",
         "    }",
