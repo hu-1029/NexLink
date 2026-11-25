@@ -746,9 +746,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                           : `还原为软件内置稳定版 (${coreState.bundledVersion || 'v1.19.29'})`
                       }
                     >
-                      {coreState.hasBackup
-                        ? `回退 ${coreState.backupVersion || ''}`.trim()
-                        : `还原 ${coreState.bundledVersion || '内置'}`.trim()}
+                      {isRollingBackCore ? '回退中...' : '回退'}
                     </Button>
                   )}
                   <Button
