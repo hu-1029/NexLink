@@ -22,10 +22,49 @@ const nativeImage = Electron.nativeImage;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export function shouldEnableRemoteDebugging(
+  isPackaged: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv
+): boolean {
+  if (isPackaged) return false;
+  return Boolean(
+    env.NEXLINK_DEBUG_PORT || argv.some((a) => a.includes('remote-debugging-port'))
+  );
+}
+
+export async function stopWithTimeoutAndFallback(
+  stopFn: () => Promise<boolean>,
+  emergencyCleanupFn: () => void,
+  timeoutMs: number = 5500
+): Promise<{ timedOut: boolean; stopped: boolean }> {
+  let timer: NodeJS.Timeout | null = null;
+  try {
+    const raceRes = await Promise.race([
+      stopFn().then((ok) => ({ kind: 'done' as const, ok })),
+      new Promise<{ kind: 'timeout' }>((resolve) => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs);
+      }),
+    ]);
+    if (raceRes.kind === 'timeout') {
+      console.warn(`[NexLink] 退出停止核心超时 (${timeoutMs}ms)，触发紧急清理兜底`);
+      emergencyCleanupFn();
+      return { timedOut: true, stopped: false };
+    }
+    return { timedOut: false, stopped: Boolean(raceRes.ok) };
+  } catch (err: any) {
+    console.error('[NexLink] 退出时停止 Mihomo 异常，触发紧急清理兜底:', err?.message || err);
+    emergencyCleanupFn();
+    return { timedOut: false, stopped: false };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 app?.commandLine?.appendSwitch('disable-color-correct-rendering');
 app?.commandLine?.appendSwitch('proxy-bypass-list', '<local>;localhost;127.0.0.1;::1');
-if (process.env.NEXLINK_DEBUG_PORT || process.argv.some(a => a.includes('remote-debugging-port'))) {
-  app?.commandLine?.appendSwitch('remote-debugging-port', '9222');
+if (app && shouldEnableRemoteDebugging(Boolean(app.isPackaged))) {
+  app.commandLine?.appendSwitch('remote-debugging-port', '9222');
 }
 
 let mainWindow: Electron.BrowserWindow | null = null;
@@ -666,13 +705,15 @@ export async function bootstrap(): Promise<void> {
     subscriptionManager.stopScheduler();
     updateService.stopAutoCheck();
 
-    try {
-      // 彻底等待 Mihomo 内核优雅退出（内部已含代理恢复与路由清理），避免多轮重复拉起 PowerShell
-      await mihomoManager.stop();
-    } catch (err: any) {
-      console.error('[NexLink] 退出时停止 Mihomo 异常:', err.message);
-    } finally {
+    const quitRes = await stopWithTimeoutAndFallback(
+      () => mihomoManager.stop(),
+      runEmergencyCleanupOnce,
+      5500
+    );
+    if (!quitRes.timedOut && quitRes.stopped) {
       isFinalCleanupDone = true;
+    } else {
+      runEmergencyCleanupOnce();
     }
 
     isGracefulQuitDone = true;

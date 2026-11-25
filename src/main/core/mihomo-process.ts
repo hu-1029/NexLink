@@ -9,11 +9,12 @@ import crypto from 'crypto';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
-import type { AppSettings, CoreStatus, LogItem, ProxyNode, TrafficStats } from '../../shared/types';
+import type { AppSettings, CoreStatus, LogItem, ProxyNode, TrafficStats, TunServiceStatus } from '../../shared/types';
 import { isCurrentProcessAdmin } from '../network/tun-checker';
 import { tunServiceManager } from '../network/service-manager';
 import { ensureWintunDriver, getWintunStatus, type WintunDriverStatus } from '../network/wintun-manager';
 import { systemProxyManager } from '../network/system-proxy';
+import { storageManager } from '../storage/store';
 import { MihomoApiClient } from './api-client';
 import { buildMihomoConfig } from './config-builder';
 import { validateMihomoConfig } from './config-validator';
@@ -489,6 +490,22 @@ export class MihomoProcessManager {
   private startTime: number = 0;
   private runMode: 'service' | 'sidecar' = 'sidecar';
   private serviceCorePid: number | undefined = undefined;
+  private serviceWatchdogTimer: NodeJS.Timeout | null = null;
+  private serviceWatchdogInFlight: boolean = false;
+  private serviceWatchdogMissCount: number = 0;
+  private serviceWatchdogHooks?: {
+    getServiceStatus?: () => Promise<TunServiceStatus>;
+    getApiVersion?: () => Promise<any>;
+    restoreProxy?: (port: number) => Promise<boolean>;
+    cleanupRoutesViaService?: () => Promise<boolean>;
+    isSystemProxyEnabled?: () => boolean;
+  };
+  private tunPrereqCheckHook?: (mixedPort: number) => Promise<{
+    serviceReady: boolean;
+    isAdmin: boolean;
+    driverOk: boolean;
+    driverError?: string;
+  }>;
   private processStartedAt: number | undefined = undefined;
   private logStream: fs.WriteStream | null = null;
   private trafficStopFn: (() => void) | null = null;
@@ -955,6 +972,7 @@ export class MihomoProcessManager {
    * 强力终极清算：确保本软件关联的 Mihomo 进程被彻底杀死，绝不允许任何孤儿进程留在后台霸占端口
    */
   public forceKillAllSync(skipPid?: number): void {
+    this.stopServiceWatchdog();
     const rec = this.readAndConsumePidFile();
     const proc = this.process;
     const procStartedAt = this.processStartedAt;
@@ -993,7 +1011,7 @@ export class MihomoProcessManager {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     return this.withLifecycleLock(() => this.startInternal(options));
   }
 
@@ -1001,11 +1019,12 @@ export class MihomoProcessManager {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     if (this.currentStatus.running && (this.process || this.runMode === 'service')) {
       return { success: true };
     }
 
+    this.stopServiceWatchdog();
     this.isStopping = false;
     const { nodes, settings, selectedNodeName } = options;
     const mixedPort = settings.mixedPort || 7890;
@@ -1016,19 +1035,29 @@ export class MihomoProcessManager {
       this.apiSecret = crypto.randomBytes(16).toString('hex');
 
       // 1.5 检测虚拟网卡特权服务模式 (对标 Clash Verge Service Mode) 与管理员权限
-      const serviceReady = await tunServiceManager.isServiceReady();
-      const isAdmin = isCurrentProcessAdmin();
+      const prereqOverride = this.tunPrereqCheckHook
+        ? await this.tunPrereqCheckHook(mixedPort)
+        : null;
+      const serviceReady = prereqOverride
+        ? prereqOverride.serviceReady
+        : await tunServiceManager.isServiceReady();
+      const isAdmin = prereqOverride ? prereqOverride.isAdmin : isCurrentProcessAdmin();
       const useServiceMode = serviceReady;
 
       let effectiveSettings = settings;
+      let tunDowngradeWarning: string | undefined;
       if (settings.tunMode) {
         if (!serviceReady && !isAdmin) {
-          console.warn('[MihomoProcess] 未安装虚拟网卡服务且非管理员权限，TUN 模式已安全降级为普通代理模式');
+          tunDowngradeWarning = '未安装虚拟网卡特权服务且非管理员权限，TUN 模式已安全降级为普通代理模式';
+          console.warn(`[MihomoProcess] ${tunDowngradeWarning}`);
           effectiveSettings = { ...settings, tunMode: false };
         } else {
-          const driverRes = await ensureWintunDriver(this.runtimeDir, this.resourcesDir, mixedPort);
+          const driverRes = prereqOverride
+            ? { ok: prereqOverride.driverOk, error: prereqOverride.driverError }
+            : await ensureWintunDriver(this.runtimeDir, this.resourcesDir, mixedPort);
           if (!driverRes.ok) {
-            console.warn(`[MihomoProcess] 虚拟网卡驱动未就绪: ${driverRes.error}，安全降级为普通代理模式`);
+            tunDowngradeWarning = `虚拟网卡驱动未就绪 (${driverRes.error || '未知错误'})，TUN 模式已安全降级为普通代理模式`;
+            console.warn(`[MihomoProcess] ${tunDowngradeWarning}`);
             effectiveSettings = { ...settings, tunMode: false };
           }
         }
@@ -1230,6 +1259,11 @@ export class MihomoProcessManager {
           this.parseAndPushStdout(text);
         });
 
+        child.on('error', (spawnErr) => {
+          console.error('[MihomoProcess] 核心子进程启动或运行出错:', spawnErr.message);
+          this.pushLog('error', `核心进程异常: ${spawnErr.message}`);
+        });
+
         child.on('exit', (code, signal) => {
           console.log(`[MihomoProcess] 核心进程退出, 退出码: ${code}, 信号: ${signal}`);
           try { if (!logStream.writableEnded) logStream.end(); } catch { /* ignore */ }
@@ -1268,7 +1302,10 @@ export class MihomoProcessManager {
           this.currentStatus.tunActive = false;
           this.onStatusCallback?.({ ...this.currentStatus });
 
-          if (settings.systemProxy) {
+          const liveSystemProxy = storageManager.getBaseDir()
+            ? Boolean(storageManager.getSettings().systemProxy)
+            : Boolean(settings.systemProxy);
+          if (liveSystemProxy) {
             systemProxyManager.restoreProxySync(actualMixedPort);
           }
 
@@ -1375,9 +1412,20 @@ export class MihomoProcessManager {
         await systemProxyManager.enableProxy(actualMixedPort, settings.bypassList, activePid);
       }
 
+      if (tunDowngradeWarning) {
+        this.pushLog('warn', tunDowngradeWarning);
+      }
+
+      if (this.runMode === 'service') {
+        this.startServiceWatchdog();
+      }
+
       this.onStatusCallback?.({ ...this.currentStatus });
       console.log('[MihomoProcess] Mihomo 核心已成功启动并就绪');
-      return { success: true };
+      return {
+        success: true,
+        ...(tunDowngradeWarning ? { warning: tunDowngradeWarning, tunDowngraded: true } : {}),
+      };
     } catch (err: any) {
       console.error('[MihomoProcess] 启动过程发生未捕获异常:', err.message);
       await this.stopInternal();
@@ -1397,6 +1445,7 @@ export class MihomoProcessManager {
 
   private async stopInternal(): Promise<boolean> {
     this.isStopping = true;
+    this.stopServiceWatchdog();
 
     // 1. 停止流量监听与日志监听
     if (this.trafficStopFn) {
@@ -1463,13 +1512,175 @@ export class MihomoProcessManager {
   }
 
   /**
+   * 启动 Service 模式健康心跳监控（防 SYSTEM 托管核心异常退出后 UI 永久假在线）
+   */
+  public startServiceWatchdog(
+    intervalMs: number = 3000,
+    hooks?: {
+      getServiceStatus?: () => Promise<TunServiceStatus>;
+      getApiVersion?: () => Promise<any>;
+      restoreProxy?: (port: number) => Promise<boolean>;
+      cleanupRoutesViaService?: () => Promise<boolean>;
+      isSystemProxyEnabled?: () => boolean;
+    }
+  ): void {
+    this.stopServiceWatchdog();
+    this.serviceWatchdogHooks = hooks;
+    this.serviceWatchdogTimer = setInterval(() => {
+      void this.checkServiceCoreHealth();
+    }, intervalMs);
+    this.serviceWatchdogTimer.unref?.();
+  }
+
+  public stopServiceWatchdog(): void {
+    if (this.serviceWatchdogTimer) {
+      clearInterval(this.serviceWatchdogTimer);
+      this.serviceWatchdogTimer = null;
+    }
+    this.serviceWatchdogMissCount = 0;
+  }
+
+  /**
+   * 单次探测 Service 托管核心存活状态，确认失联/退出后自动恢复代理、清路由并重置状态
+   */
+  public async checkServiceCoreHealth(): Promise<boolean> {
+    if (
+      this.isStopping ||
+      !this.currentStatus.running ||
+      this.runMode !== 'service' ||
+      this.serviceWatchdogInFlight
+    ) {
+      return false;
+    }
+
+    this.serviceWatchdogInFlight = true;
+    try {
+      const getSvcStatus =
+        this.serviceWatchdogHooks?.getServiceStatus ??
+        (() => tunServiceManager.getServiceStatus());
+      const getApiVer =
+        this.serviceWatchdogHooks?.getApiVersion ?? (() => this.apiClient.getVersion());
+
+      let svcStatus: TunServiceStatus | null = null;
+      try {
+        svcStatus = await getSvcStatus();
+      } catch {
+        svcStatus = null;
+      }
+
+      if (svcStatus?.reachable) {
+        if (svcStatus.coreRunning === true) {
+          if (
+            this.serviceCorePid &&
+            svcStatus.corePid &&
+            svcStatus.corePid !== this.serviceCorePid
+          ) {
+            console.warn(
+              `[MihomoProcess] Service 核心 PID 变更 (${this.serviceCorePid} -> ${svcStatus.corePid})`
+            );
+            this.serviceCorePid = svcStatus.corePid;
+          }
+          try {
+            await getApiVer();
+            this.serviceWatchdogMissCount = 0;
+            return true;
+          } catch {
+            // 服务声明运行但 REST API 无响应，计一次异常
+          }
+        } else {
+          // 服务端明确确认 _coreProcess.HasExited === true
+          this.serviceWatchdogMissCount = 2;
+        }
+      } else {
+        // 服务不可达，回退探测 REST API 确认核心是否仍存活
+        try {
+          await getApiVer();
+          this.serviceWatchdogMissCount = 0;
+          return true;
+        } catch {
+          this.serviceWatchdogMissCount++;
+        }
+      }
+
+      if (this.serviceWatchdogMissCount < 2) {
+        return true;
+      }
+
+      await this.withLifecycleLock(async () => {
+        if (this.isStopping || !this.currentStatus.running || this.runMode !== 'service') {
+          return;
+        }
+        this.stopServiceWatchdog();
+        console.error('[MihomoProcess] 检测到 Service 模式托管的 Mihomo 核心异常退出，正在执行自动善后恢复...');
+        this.pushLog('error', '检测到服务模式核心异常退出，已自动恢复系统代理并重置运行状态');
+
+        try {
+          if (this.crashLogPath) {
+            fs.appendFileSync(
+              this.crashLogPath,
+              `[${new Date().toISOString()}] Service 模式 Mihomo 异常退出 (PID=${this.serviceCorePid || 'unknown'})\n\n`,
+              'utf8'
+            );
+          }
+        } catch {
+          // ignore
+        }
+
+        if (this.trafficStopFn) {
+          this.trafficStopFn();
+          this.trafficStopFn = null;
+        }
+        if (this.logStreamStopFn) {
+          this.logStreamStopFn();
+          this.logStreamStopFn = null;
+        }
+
+        try {
+          const pidFile = this.getPidFilePath();
+          if (pidFile && fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+        } catch {
+          // ignore
+        }
+
+        const mixedPort = this.currentStatus.mixedPort || 7890;
+        this.serviceCorePid = undefined;
+        this.currentStatus.running = false;
+        this.currentStatus.tunActive = false;
+        this.onStatusCallback?.({ ...this.currentStatus });
+
+        const liveProxy = this.serviceWatchdogHooks?.isSystemProxyEnabled
+          ? this.serviceWatchdogHooks.isSystemProxyEnabled()
+          : Boolean(storageManager.getBaseDir() ? storageManager.getSettings().systemProxy : false);
+        if (liveProxy) {
+          const restoreFn =
+            this.serviceWatchdogHooks?.restoreProxy ??
+            ((p: number) => systemProxyManager.restoreProxy(p));
+          await restoreFn(mixedPort).catch(() => false);
+        }
+
+        this.cleanupTunRoutesSync();
+        if (svcStatus?.reachable) {
+          const cleanupSvcFn =
+            this.serviceWatchdogHooks?.cleanupRoutesViaService ??
+            (() => tunServiceManager.cleanupRoutesViaService());
+          await cleanupSvcFn().catch(() => false);
+        }
+      });
+
+      return false;
+    } finally {
+      this.serviceWatchdogInFlight = false;
+    }
+  }
+
+  /**
    * 重启核心
    */
   public restart(options: {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     return this.withLifecycleLock(() => this.restartInternal(options));
   }
 
@@ -1477,7 +1688,7 @@ export class MihomoProcessManager {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     await this.stopInternal();
     await new Promise((resolve) => setTimeout(resolve, 500));
     return this.startInternal(options);
@@ -1490,7 +1701,7 @@ export class MihomoProcessManager {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     return this.withLifecycleLock(() => this.hotReloadOrRestartInternal(options));
   }
 
@@ -1498,27 +1709,38 @@ export class MihomoProcessManager {
     nodes: ProxyNode[];
     settings: AppSettings;
     selectedNodeName?: string;
-  }): Promise<{ success: boolean; error?: string }> {
+  }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> {
     if (!this.currentStatus.running) {
       return this.startInternal(options);
     }
 
-    const serviceReady = await tunServiceManager.isServiceReady();
-    const isAdmin = isCurrentProcessAdmin();
+    const hotPort = this.currentStatus.mixedPort || options.settings.mixedPort || 7890;
+    const prereqOverride = this.tunPrereqCheckHook
+      ? await this.tunPrereqCheckHook(hotPort)
+      : null;
+    const serviceReady = prereqOverride
+      ? prereqOverride.serviceReady
+      : await tunServiceManager.isServiceReady();
+    const isAdmin = prereqOverride ? prereqOverride.isAdmin : isCurrentProcessAdmin();
     let effectiveSettings = options.settings;
+    let tunDowngradeWarning: string | undefined;
 
     if (options.settings.tunMode) {
       if (!serviceReady && !isAdmin) {
-        console.warn('[MihomoProcess] 热重载检测到未安装虚拟网卡服务且为普通权限，TUN 已安全降级为普通代理模式');
+        tunDowngradeWarning = '未安装虚拟网卡特权服务且非管理员权限，TUN 模式已安全降级为普通代理模式';
+        console.warn(`[MihomoProcess] 热重载: ${tunDowngradeWarning}`);
         effectiveSettings = { ...options.settings, tunMode: false };
       } else {
-        const driverRes = await ensureWintunDriver(
-          this.runtimeDir,
-          this.resourcesDir,
-          this.currentStatus.mixedPort || options.settings.mixedPort
-        );
+        const driverRes = prereqOverride
+          ? { ok: prereqOverride.driverOk, error: prereqOverride.driverError }
+          : await ensureWintunDriver(
+              this.runtimeDir,
+              this.resourcesDir,
+              this.currentStatus.mixedPort || options.settings.mixedPort
+            );
         if (!driverRes.ok) {
-          console.warn(`[MihomoProcess] 热重载检测到虚拟网卡驱动未就绪: ${driverRes.error}，安全降级为普通代理模式`);
+          tunDowngradeWarning = `虚拟网卡驱动未就绪 (${driverRes.error || '未知错误'})，TUN 模式已安全降级为普通代理模式`;
+          console.warn(`[MihomoProcess] 热重载: ${tunDowngradeWarning}`);
           effectiveSettings = { ...options.settings, tunMode: false };
         } else if (serviceReady && this.runMode !== 'service') {
           // 刚安装完特权服务但当前核心仍是普通权限子进程，自动平滑迁移到服务模式以激活 TUN
@@ -1546,8 +1768,17 @@ export class MihomoProcessManager {
       if (fs.existsSync(this.configPath)) {
         const currentYaml = fs.readFileSync(this.configPath, 'utf8');
         if (currentYaml === newConfigYaml) {
+          if (lockedSettings.mode) {
+            this.currentStatus.mode = lockedSettings.mode;
+          }
+          if (tunDowngradeWarning) {
+            this.pushLog('warn', tunDowngradeWarning);
+          }
           console.log('[MihomoProcess] 配置内容未变动，无需重载');
-          return { success: true };
+          return {
+            success: true,
+            ...(tunDowngradeWarning ? { warning: tunDowngradeWarning, tunDowngraded: true } : {}),
+          };
         }
       }
 
@@ -1580,7 +1811,13 @@ export class MihomoProcessManager {
       this.attachLogStream(lockedSettings.logLevel || 'info');
       const wasTunActive = Boolean(this.currentStatus.tunActive);
       this.currentStatus.tunActive = Boolean(effectiveSettings.tunMode);
-        if (effectiveSettings.tunMode) this.tunActivatedInSession = true;
+      if (lockedSettings.mode) {
+        this.currentStatus.mode = lockedSettings.mode;
+      }
+      if (effectiveSettings.tunMode) this.tunActivatedInSession = true;
+      if (tunDowngradeWarning) {
+        this.pushLog('warn', tunDowngradeWarning);
+      }
       this.onStatusCallback?.({ ...this.currentStatus });
       console.log('[MihomoProcess] 平滑热重载成功，现有网络连接无中断保持');
 
@@ -1601,7 +1838,10 @@ export class MihomoProcessManager {
         }
       }
 
-      return { success: true };
+      return {
+        success: true,
+        ...(tunDowngradeWarning ? { warning: tunDowngradeWarning, tunDowngraded: true } : {}),
+      };
     } catch (err: any) {
       console.warn('[MihomoProcess] 平滑热重载遇到异常，安全降级为重启核心:', err.message);
       return this.restartInternal({ ...options, settings: effectiveSettings });
