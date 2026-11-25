@@ -1,5 +1,4 @@
 import * as Electron from 'electron';
-import path from 'path';
 import { IPC_CHANNELS } from '../../shared/ipc-events';
 import type {
   AppInfo,
@@ -12,8 +11,9 @@ import { mihomoManager } from '../core/mihomo-process';
 import { systemProxyManager } from '../network/system-proxy';
 import { checkTunPrerequisites, isCurrentProcessAdmin, restartAsAdmin } from '../network/tun-checker';
 import { tunServiceManager } from '../network/service-manager';
-import { storageManager } from '../storage/store';
+import { storageManager, type AppPersistedState } from '../storage/store';
 import { subscriptionManager } from '../subscription/manager';
+import { resolveSafeLocalProfilePath } from '../subscription/fetcher';
 import { buildMihomoConfig } from '../core/config-builder';
 import { isValidPort } from '../../services/node/node-utils';
 import { NetworkTester } from '../services/network-tester';
@@ -22,17 +22,175 @@ import { updateService } from '../services/updater';
 import { coreUpdaterService } from '../services/core-updater';
 
 const app = Electron.app;
-const ipcMain = Electron.ipcMain;
+const defaultIpcMain = Electron.ipcMain;
 const networkTester = new NetworkTester(mihomoManager);
 
 export interface IpcHandlerOptions {
   onSettingsUpdated?: (settings: Partial<AppSettings>) => void;
+  ipcMainInstance?: Pick<Electron.IpcMain, 'handle' | 'removeHandler'>;
+}
+
+function isPlainObject(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * 校验并标准化 CORE_START / CORE_RESTART 传入载荷，拦截非法结构与越界端口
+ */
+export function resolveCoreLifecyclePayload(
+  payload: unknown,
+  persistedSettings: AppSettings,
+  persistedNodes: ProxyNode[],
+  state: AppPersistedState
+): { nodes: ProxyNode[]; settings: AppSettings; selectedNodeName?: string } {
+  if (payload !== undefined && payload !== null && !isPlainObject(payload)) {
+    throw new Error('无效的核心启动参数载荷: 必须为对象');
+  }
+
+  const raw = isPlainObject(payload) ? payload : {};
+
+  if (raw.selectedNodeName !== undefined && typeof raw.selectedNodeName !== 'string') {
+    throw new Error('无效的核心启动参数: selectedNodeName 必须为字符串');
+  }
+
+  let nodes = persistedNodes;
+  if (raw.nodes !== undefined) {
+    if (!Array.isArray(raw.nodes)) {
+      throw new Error('无效的核心启动参数: nodes 必须为数组');
+    }
+    for (const node of raw.nodes) {
+      if (!isPlainObject(node)) {
+        throw new Error('无效的核心启动参数: nodes 包含非法的节点对象');
+      }
+      if (node.port !== undefined && !isValidPort(node.port)) {
+        throw new Error(`无效的核心启动参数: 节点端口非法 (${String(node.port)})`);
+      }
+    }
+    nodes = raw.nodes as ProxyNode[];
+  }
+
+  let settings = persistedSettings;
+  if (raw.settings !== undefined) {
+    if (!isPlainObject(raw.settings)) {
+      throw new Error('无效的核心启动参数: settings 必须为对象');
+    }
+    const inputSettings = raw.settings;
+    if (inputSettings.mixedPort !== undefined && !isValidPort(inputSettings.mixedPort)) {
+      throw new Error(`系统混合代理端口非法 (必须为 1-65535 整数): ${inputSettings.mixedPort}`);
+    }
+    if (inputSettings.apiPort !== undefined && !isValidPort(inputSettings.apiPort)) {
+      throw new Error(`控制端口非法 (必须为 1-65535 整数): ${inputSettings.apiPort}`);
+    }
+    if (
+      inputSettings.mode !== undefined &&
+      !['rule', 'global', 'direct'].includes(inputSettings.mode)
+    ) {
+      throw new Error(`非法的代理运行模式: ${String(inputSettings.mode)}`);
+    }
+    if (inputSettings.tunMode !== undefined && typeof inputSettings.tunMode !== 'boolean') {
+      throw new Error('无效的核心启动参数: tunMode 必须为布尔值');
+    }
+    if (inputSettings.allowLan !== undefined && typeof inputSettings.allowLan !== 'boolean') {
+      throw new Error('无效的核心启动参数: allowLan 必须为布尔值');
+    }
+    if (inputSettings.systemProxy !== undefined && typeof inputSettings.systemProxy !== 'boolean') {
+      throw new Error('无效的核心启动参数: systemProxy 必须为布尔值');
+    }
+    if (inputSettings.dns !== undefined && !isPlainObject(inputSettings.dns)) {
+      throw new Error('无效的核心启动参数: dns 必须为对象');
+    }
+
+    const targetMixedPort = Number(inputSettings.mixedPort ?? persistedSettings.mixedPort ?? 7890);
+    const targetApiPort = Number(inputSettings.apiPort ?? persistedSettings.apiPort ?? 9097);
+    if (targetMixedPort === targetApiPort) {
+      throw new Error(`端口冲突: 混合代理端口与控制端口不能相同 (${targetMixedPort})`);
+    }
+
+    settings = {
+      ...persistedSettings,
+      ...inputSettings,
+      ...(inputSettings.dns
+        ? { dns: { ...(persistedSettings.dns || {}), ...inputSettings.dns } }
+        : {}),
+    } as AppSettings;
+  }
+
+  const selectedNodeName =
+    raw.selectedNodeName ||
+    state.selectedNodeName ||
+    (state.activeNodeId ? nodes.find((n) => n.id === state.activeNodeId)?.name : undefined);
+
+  return { nodes, settings, selectedNodeName };
+}
+
+/**
+ * 校验并清洗 SUB_ADD 入参：严禁本地订阅经 url 读取文件，并强制通过 realpathSync 锁定在 profiles/ 目录内
+ */
+export function sanitizeAndValidateSubAddPayload(subData: unknown, baseDir: string): any {
+  if (!isPlainObject(subData)) {
+    throw new Error('无效的订阅参数');
+  }
+
+  const safeSubData: Record<string, any> = { ...subData };
+  const subType =
+    safeSubData.type === 'local' ? 'local' : safeSubData.type === 'remote' ? 'remote' : null;
+  if (!subType) {
+    throw new Error(`无效的订阅类型: ${String(safeSubData.type)}`);
+  }
+
+  if (subType === 'local') {
+    if (
+      safeSubData.url !== undefined &&
+      safeSubData.url !== null &&
+      String(safeSubData.url).trim() !== ''
+    ) {
+      throw new Error('安全拦截: 本地订阅不允许传入 url 参数');
+    }
+    delete safeSubData.url;
+
+    if (safeSubData.filePath !== undefined && safeSubData.filePath !== null) {
+      if (typeof safeSubData.filePath !== 'string') {
+        throw new Error('无效的本地订阅 filePath 参数');
+      }
+      if (safeSubData.filePath.trim() !== '') {
+        const pathCheck = resolveSafeLocalProfilePath(safeSubData.filePath, baseDir);
+        if (!pathCheck.ok) {
+          throw new Error(pathCheck.error);
+        }
+        safeSubData.filePath = pathCheck.realPath;
+      } else {
+        delete safeSubData.filePath;
+      }
+    }
+
+    if (safeSubData.rawContent !== undefined && typeof safeSubData.rawContent !== 'string') {
+      throw new Error('无效的本地订阅 rawContent 参数');
+    }
+  } else {
+    if (
+      safeSubData.filePath !== undefined &&
+      safeSubData.filePath !== null &&
+      String(safeSubData.filePath).trim() !== ''
+    ) {
+      throw new Error('安全拦截: 远程订阅不允许传入本地 filePath 参数');
+    }
+    delete safeSubData.filePath;
+
+    const urlStr = typeof safeSubData.url === 'string' ? safeSubData.url.trim() : '';
+    if (!/^https?:\/\//i.test(urlStr)) {
+      throw new Error('远程订阅必须提供有效的 http:// 或 https:// 地址');
+    }
+    safeSubData.url = urlStr;
+  }
+
+  return safeSubData;
 }
 
 export function registerIpcHandlers(
   mainWindow: Electron.BrowserWindow,
   options?: IpcHandlerOptions
 ): void {
+  const ipcMain = options?.ipcMainInstance || defaultIpcMain;
   // 防止窗口重建时重复注册 ipcMain.handle 抛出致命异常
   for (const ch of Object.values(IPC_CHANNELS)) {
     ipcMain.removeHandler(ch);
@@ -113,20 +271,13 @@ export function registerIpcHandlers(
       _,
       payload: { nodes?: ProxyNode[]; settings?: AppSettings; selectedNodeName?: string }
     ): Promise<{ success: boolean; error?: string }> => {
-      const persistedSettings = storageManager.getSettings();
-      const settings = payload?.settings || persistedSettings;
-      const nodes = payload?.nodes || storageManager.getNodes();
-      const state = storageManager.getState();
-      const selectedNodeName =
-        payload?.selectedNodeName ||
-        state.selectedNodeName ||
-        (state.activeNodeId ? nodes.find((n) => n.id === state.activeNodeId)?.name : undefined);
-
-      return await mihomoManager.start({
-        nodes,
-        settings,
-        selectedNodeName,
-      });
+      const startOptions = resolveCoreLifecyclePayload(
+        payload,
+        storageManager.getSettings(),
+        storageManager.getNodes(),
+        storageManager.getState()
+      );
+      return await mihomoManager.start(startOptions);
     }
   );
 
@@ -140,20 +291,13 @@ export function registerIpcHandlers(
       _,
       payload: { nodes?: ProxyNode[]; settings?: AppSettings; selectedNodeName?: string }
     ): Promise<{ success: boolean; error?: string }> => {
-      const persistedSettings = storageManager.getSettings();
-      const settings = payload?.settings || persistedSettings;
-      const nodes = payload?.nodes || storageManager.getNodes();
-      const state = storageManager.getState();
-      const selectedNodeName =
-        payload?.selectedNodeName ||
-        state.selectedNodeName ||
-        (state.activeNodeId ? nodes.find((n) => n.id === state.activeNodeId)?.name : undefined);
-
-      return await mihomoManager.restart({
-        nodes,
-        settings,
-        selectedNodeName,
-      });
+      const restartOptions = resolveCoreLifecyclePayload(
+        payload,
+        storageManager.getSettings(),
+        storageManager.getNodes(),
+        storageManager.getState()
+      );
+      return await mihomoManager.restart(restartOptions);
     }
   );
 
@@ -323,20 +467,7 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle(IPC_CHANNELS.SUB_ADD, async (_, subData: any) => {
-    const safeSubData = { ...(subData || {}) };
-    if (safeSubData.filePath) {
-      const baseDir = storageManager.getBaseDir();
-      const resolvedBase = baseDir ? path.resolve(baseDir) : '';
-      const basePrefix = resolvedBase
-        ? resolvedBase.endsWith(path.sep)
-          ? resolvedBase
-          : resolvedBase + path.sep
-        : '';
-      const resolved = path.resolve(String(safeSubData.filePath));
-      if (!basePrefix || !resolved.startsWith(basePrefix)) {
-        delete safeSubData.filePath;
-      }
-    }
+    const safeSubData = sanitizeAndValidateSubAddPayload(subData, storageManager.getBaseDir());
     return await subscriptionManager.addSubscription(safeSubData);
   });
 

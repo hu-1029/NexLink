@@ -20,15 +20,16 @@ describe('订阅生命周期管理 SubscriptionManager 单元测试', () => {
 
   const manager = new SubscriptionManager(storage, mockMihomo);
 
-  const localSubFile = path.join(testDir, 'sub1.txt');
-  fs.mkdirSync(testDir, { recursive: true });
+  const profilesDir = path.join(testDir, 'profiles');
+  const localSubFile = path.join(profilesDir, 'sub1.txt');
+  fs.mkdirSync(profilesDir, { recursive: true });
   fs.writeFileSync(localSubFile, SAMPLE_BASE64_SUBSCRIPTION, 'utf8');
 
   it('1. 添加本地文件订阅并成功拉取解析节点', async () => {
     const sub = await manager.addSubscription({
       name: '本地测试订阅',
       type: 'local',
-      url: localSubFile,
+      filePath: localSubFile,
     });
 
     assert.ok(sub.id.startsWith('sub-'));
@@ -43,13 +44,13 @@ describe('订阅生命周期管理 SubscriptionManager 单元测试', () => {
   });
 
   it('2. 多源合并与节点归属标签验证', async () => {
-    const localSubFile2 = path.join(testDir, 'sub2.txt');
+    const localSubFile2 = path.join(profilesDir, 'sub2.txt');
     fs.writeFileSync(localSubFile2, SAMPLE_BASE64_SUBSCRIPTION, 'utf8');
 
     const sub2 = await manager.addSubscription({
       name: '订阅二（独立订阅命名空间）',
       type: 'local',
-      url: localSubFile2,
+      filePath: localSubFile2,
     });
 
     const allNodes = storage.getNodes();

@@ -112,7 +112,9 @@ export class SubscriptionManager {
       this.storage.saveSubscriptions([...initialSubs]);
       this.onDataChangedCallback?.();
 
-      const fetchResult = await fetchSubscription(fetchSnapshot);
+      const fetchResult = await fetchSubscription(fetchSnapshot, {
+        allowedBaseDir: this.storage.getBaseDir(),
+      });
       const now = Date.now();
       const dateObj = new Date(now);
       const pad = (n: number) => String(n).padStart(2, '0');

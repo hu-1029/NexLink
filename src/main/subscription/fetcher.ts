@@ -5,8 +5,10 @@
  */
 
 import fs from 'fs';
-import type { ProfileItem, ProxyNode, SubscriptionUserInfo } from '../../shared/types';
+import path from 'path';
+import type { ParseError, ProfileItem, ProxyNode, SubscriptionUserInfo } from '../../shared/types';
 import { smartParse } from '../../services/importer/smart-importer';
+import { storageManager } from '../storage/store';
 
 export interface FetchSubscriptionResult {
   success: boolean;
@@ -74,6 +76,80 @@ export interface FetchOptions {
   retries?: number;
   maxBytes?: number;
   retryDelayMs?: number;
+  allowedBaseDir?: string;
+}
+
+function isPathInsideDir(parentDir: string, childPath: string): boolean {
+  const normParent = process.platform === 'win32' ? parentDir.toLowerCase() : parentDir;
+  const normChild = process.platform === 'win32' ? childPath.toLowerCase() : childPath;
+  const rel = path.relative(normParent, normChild);
+  return (
+    rel !== '' &&
+    rel !== '..' &&
+    !rel.startsWith('..' + path.sep) &&
+    !rel.startsWith('../') &&
+    !path.isAbsolute(rel)
+  );
+}
+
+/**
+ * 校验本地订阅文件路径是否严格位于受控 profiles/ 目录内（基于 realpathSync 阻断目录穿越与符号链接逃逸）
+ */
+export function resolveSafeLocalProfilePath(
+  candidatePath: string,
+  baseDir?: string
+): { ok: true; realPath: string } | { ok: false; error: string } {
+  if (typeof candidatePath !== 'string' || !candidatePath.trim()) {
+    return { ok: false, error: '本地订阅文件路径不能为空' };
+  }
+
+  const effectiveBaseDir = baseDir !== undefined ? baseDir : storageManager.getBaseDir();
+  if (!effectiveBaseDir || !effectiveBaseDir.trim()) {
+    return { ok: false, error: '受控存储目录未初始化，已拒绝读取本地文件' };
+  }
+
+  const profilesDir = path.resolve(effectiveBaseDir, 'profiles');
+  const resolvedCandidate = path.resolve(candidatePath.trim());
+
+  // 词法预检：先阻断明显位于受控目录之外的路径，避免对任意磁盘路径做存在性探测
+  if (!isPathInsideDir(profilesDir, resolvedCandidate)) {
+    return { ok: false, error: '安全拦截: 本地订阅文件必须位于受控 profiles 目录内' };
+  }
+
+  if (!fs.existsSync(profilesDir)) {
+    return { ok: false, error: '受控 profiles 目录不存在' };
+  }
+
+  try {
+    const realProfilesDir = fs.realpathSync(profilesDir);
+    if (!fs.existsSync(resolvedCandidate)) {
+      return { ok: false, error: '本地配置文件不存在或不可访问' };
+    }
+    const realTarget = fs.realpathSync(resolvedCandidate);
+    if (!isPathInsideDir(realProfilesDir, realTarget)) {
+      return { ok: false, error: '安全拦截: 检测到路径穿越或符号链接逃逸，已拒绝读取' };
+    }
+    return { ok: true, realPath: realTarget };
+  } catch (err: any) {
+    return { ok: false, error: `本地配置文件路径校验失败: ${err?.message || '不可访问'}` };
+  }
+}
+
+/**
+ * 将 ParseError[] 格式化为可读文本，避免出现 [object Object]
+ */
+export function formatParseErrors(errors?: ParseError[]): string {
+  if (!Array.isArray(errors) || errors.length === 0) {
+    return '';
+  }
+  return errors
+    .map((err) => {
+      if (typeof err === 'string') return err;
+      const msg = err?.error || '未知解析错误';
+      return err?.line !== undefined ? `第 ${err.line} 行: ${msg}` : msg;
+    })
+    .filter(Boolean)
+    .join('; ');
 }
 
 /**
@@ -185,39 +261,54 @@ export async function fetchSubscription(
 ): Promise<FetchSubscriptionResult> {
   let sub: ProfileItem;
   if (typeof subInput === 'string') {
-    if (subInput.startsWith('http://') || subInput.startsWith('https://')) {
-      sub = { id: 'temp', name: 'temp', type: 'remote', url: subInput, nodeCount: 0, updatedAt: '', status: 'ok' };
+    const trimmed = subInput.trim();
+    if (/^https?:\/\//i.test(trimmed)) {
+      sub = { id: 'temp', name: 'temp', type: 'remote', url: trimmed, nodeCount: 0, updatedAt: '', status: 'ok' };
     } else {
-      sub = { id: 'temp', name: 'temp', type: 'local', filePath: subInput, nodeCount: 0, updatedAt: '', status: 'ok' };
+      sub = { id: 'temp', name: 'temp', type: 'local', filePath: trimmed, nodeCount: 0, updatedAt: '', status: 'ok' };
     }
   } else {
-    sub = {
-      ...subInput,
-      filePath: subInput.filePath || (subInput.type === 'local' ? subInput.url : undefined),
-    };
+    // 禁止将 ProfileItem.url 回退当成本地 filePath
+    sub = { ...subInput };
   }
 
-  // 1. 本地文件或自定义原始文本 (Direct content / Base64 / URI / Local file)
-  if (sub.type === 'local' || (!sub.url?.startsWith('http://') && !sub.url?.startsWith('https://'))) {
-    const targetPath = sub.filePath || sub.url;
+  // 1. 本地文件或自定义原始文本 (Direct content / Base64 / URI / Sandboxed local file)
+  if (sub.type === 'local') {
+    if (sub.url && sub.url.trim()) {
+      return {
+        success: false,
+        nodes: [],
+        error: '安全拦截: 本地订阅不允许通过 url 字段读取路径或内容',
+      };
+    }
 
-    // 情况 A: 提供了本地磁盘上真实存在的文件路径
-    if (targetPath && fs.existsSync(targetPath)) {
+    // 情况 A: 提供了本地文件路径（强制 realpathSync 锁定在受控 profiles/ 目录内）
+    if (sub.filePath && sub.filePath.trim()) {
+      const pathCheck = resolveSafeLocalProfilePath(sub.filePath, options?.allowedBaseDir);
+      if (!pathCheck.ok) {
+        return {
+          success: false,
+          nodes: [],
+          error: pathCheck.error,
+        };
+      }
+
       try {
-        const stat = fs.statSync(targetPath);
+        const stat = fs.statSync(pathCheck.realPath);
         if (!stat.isFile()) {
           return { success: false, nodes: [], error: '目标路径不是有效文件' };
         }
         if (stat.size > 15 * 1024 * 1024) {
           return { success: false, nodes: [], error: '本地配置文件体积超过 15MB 安全上限' };
         }
-        const content = fs.readFileSync(targetPath, 'utf8');
+        const content = fs.readFileSync(pathCheck.realPath, 'utf8');
         const parseRes = smartParse(content, { subscriptionId: sub.id });
         if (!parseRes.success || parseRes.nodes.length === 0) {
+          const detailErr = formatParseErrors(parseRes.errors);
           return {
             success: false,
             nodes: [],
-            error: parseRes.errors?.[0]?.error || '本地配置文件中未解析出有效节点',
+            error: detailErr || '本地配置文件中未解析出有效节点',
           };
         }
         const taggedNodes = parseRes.nodes.map((n) => ({
@@ -240,13 +331,12 @@ export async function fetchSubscription(
     }
 
     // 情况 B: 用户在地址栏直接粘贴了节点 URI (vless/vmess/ss/trojan/hy2/tuic/wg), Base64 密文或 YAML/JSON 配置内容
-    const rawContent = sub.rawContent || targetPath;
+    const rawContent = sub.rawContent;
     if (rawContent && rawContent.trim()) {
       try {
         const parseRes = smartParse(rawContent.trim(), { subscriptionId: sub.id });
         if (parseRes.nodes.length === 0) {
-          const detailErr =
-            parseRes.errors.length > 0 ? parseRes.errors.join('; ') : '未能识别出有效的代理节点';
+          const detailErr = formatParseErrors(parseRes.errors) || '未能识别出有效的代理节点';
           return {
             success: false,
             nodes: [],
@@ -275,12 +365,12 @@ export async function fetchSubscription(
     return {
       success: false,
       nodes: [],
-      error: `无效的本地文件路径或未提供内容: ${targetPath || '未提供'}`,
+      error: '无效的本地文件路径或未提供内容',
     };
   }
 
   // 2. 远程 HTTP/HTTPS 订阅拉取
-  if (!sub.url || !sub.url.startsWith('http')) {
+  if (!sub.url || !/^https?:\/\//i.test(sub.url.trim())) {
     return {
       success: false,
       nodes: [],
@@ -328,11 +418,14 @@ export async function fetchSubscription(
     const parseRes = smartParse(rawContent, { subscriptionId: sub.id });
 
     if (!parseRes.success || parseRes.nodes.length === 0) {
+      const detailErr = formatParseErrors(parseRes.errors);
       return {
         success: false,
         nodes: [],
         userInfo,
-        error: `无法从订阅内容中解析出有效代理节点 (格式: ${parseRes.format})`,
+        error: detailErr
+          ? `无法从订阅内容中解析出有效代理节点 (格式: ${parseRes.format}): ${detailErr}`
+          : `无法从订阅内容中解析出有效代理节点 (格式: ${parseRes.format})`,
       };
     }
 
