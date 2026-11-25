@@ -1586,6 +1586,7 @@ export class MihomoProcessManager {
             return true;
           } catch {
             // 服务声明运行但 REST API 无响应，计一次异常
+            this.serviceWatchdogMissCount++;
           }
         } else {
           // 服务端明确确认 _coreProcess.HasExited === true

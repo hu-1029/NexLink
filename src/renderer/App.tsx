@@ -383,6 +383,14 @@ export const App: React.FC = () => {
         } else {
           const status = await window.nexlinkAPI.core.getStatus();
           setCoreStatus(status);
+          if (res.warning) {
+            showToast({
+              type: 'warning',
+              title: 'TUN 模式已安全降级',
+              message: res.warning,
+              durationMs: 5000,
+            });
+          }
         }
       }
     } catch (err: any) {
@@ -405,7 +413,16 @@ export const App: React.FC = () => {
       } else {
         const status = await window.nexlinkAPI.core.getStatus();
         setCoreStatus(status);
-        showToast({ type: 'success', title: '代理核心已重启', durationMs: 2500 });
+        if (res.warning) {
+          showToast({
+            type: 'warning',
+            title: '代理核心已重启（TUN 已降级）',
+            message: res.warning,
+            durationMs: 5000,
+          });
+        } else {
+          showToast({ type: 'success', title: '代理核心已重启', durationMs: 2500 });
+        }
       }
     } catch (err: any) {
       showToast({ type: 'error', title: '核心重启异常', message: err?.message || '未知错误' });

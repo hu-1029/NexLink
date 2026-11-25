@@ -37,14 +37,14 @@ export const nexlinkAPI = {
       nodes?: ProxyNode[];
       settings?: AppSettings;
       selectedNodeName?: string;
-    }): Promise<{ success: boolean; error?: string }> =>
+    }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> =>
       ipcRenderer.invoke(IPC_CHANNELS.CORE_START, payload),
     stop: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.CORE_STOP),
     restart: (payload?: {
       nodes?: ProxyNode[];
       settings?: AppSettings;
       selectedNodeName?: string;
-    }): Promise<{ success: boolean; error?: string }> =>
+    }): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> =>
       ipcRenderer.invoke(IPC_CHANNELS.CORE_RESTART, payload),
     setMode: (mode: 'rule' | 'global' | 'direct'): Promise<boolean> =>
       ipcRenderer.invoke(IPC_CHANNELS.CORE_SET_MODE, mode),

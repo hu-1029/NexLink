@@ -133,6 +133,61 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
     mgr.stopServiceWatchdog();
   });
 
+  it('2b. Service 声明 coreRunning=true 但 REST API 连续 2 次无响应时同样触发恢复', async () => {
+    const mgr = new MihomoProcessManager();
+    (mgr as any).runMode = 'service';
+    (mgr as any).serviceCorePid = 7766;
+    (mgr as any).currentStatus = {
+      running: true,
+      version: 'Mihomo v1.19.29',
+      mixedPort: 17892,
+      apiPort: 19099,
+      uptime: 5,
+      mode: 'rule',
+      coreRunMode: 'service',
+      tunActive: true,
+    };
+
+    let restoredPort: number | null = null;
+    let routesCleaned = false;
+    mgr.startServiceWatchdog(60000, {
+      getServiceStatus: async () => ({
+        installed: true,
+        running: true,
+        reachable: true,
+        coreRunning: true,
+        corePid: 7766,
+      }),
+      getApiVersion: async () => {
+        throw new Error('Request timeout');
+      },
+      restoreProxy: async (port) => {
+        restoredPort = port;
+        return true;
+      },
+      cleanupRoutesViaService: async () => {
+        routesCleaned = true;
+        return true;
+      },
+      isSystemProxyEnabled: () => true,
+    });
+
+    // 第 1 次 REST API 无响应：计数加 1，暂不复位
+    const firstProbe = await mgr.checkServiceCoreHealth();
+    assert.equal(firstProbe, true);
+    assert.equal(mgr.getStatus().running, true);
+    assert.equal(restoredPort, null);
+
+    // 第 2 次 REST API 无响应：触发自动恢复
+    const secondProbe = await mgr.checkServiceCoreHealth();
+    assert.equal(secondProbe, false);
+    assert.equal(mgr.getStatus().running, false);
+    assert.equal(mgr.getStatus().tunActive, false);
+    assert.equal(restoredPort, 17892);
+    assert.equal(routesCleaned, true);
+    mgr.stopServiceWatchdog();
+  });
+
   it('3. hotReloadOrRestart 同步更新 currentStatus.mode 并在 TUN 降级时返回警告标记', async () => {
     const resourcesDir = path.resolve('resources');
     const exePath = path.join(resourcesDir, 'mihomo/mihomo.exe');

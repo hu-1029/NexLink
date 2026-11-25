@@ -1139,15 +1139,27 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                         v{updateResult.latestVersion}
                       </span>
                     </div>
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => handleStartDownload()}
-                      className="text-xs px-2.5 py-1 font-bold flex items-center gap-1 cursor-pointer"
-                    >
-                      <Download className="w-3 h-3" />
-                      立即下载
-                    </Button>
+                    {updateResult.downloadUrl ? (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => handleStartDownload()}
+                        className="text-xs px-2.5 py-1 font-bold flex items-center gap-1 cursor-pointer"
+                      >
+                        <Download className="w-3 h-3" />
+                        立即下载
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => handleOpenUrl(updateResult.htmlUrl || 'https://github.com/hu-1029/NexLink/releases')}
+                        className="text-xs px-2.5 py-1 font-bold flex items-center gap-1 cursor-pointer"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        前往 Release 页面
+                      </Button>
+                    )}
                   </div>
                   {updateResult.releaseNotes && (
                     <div className="text-[11px] text-slate-600 dark:text-slate-300 max-h-20 overflow-y-auto leading-relaxed whitespace-pre-wrap bg-black/[0.03] dark:bg-black/20 p-2 rounded-lg font-sans">

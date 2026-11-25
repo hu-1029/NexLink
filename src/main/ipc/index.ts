@@ -270,7 +270,7 @@ export function registerIpcHandlers(
     async (
       _,
       payload: { nodes?: ProxyNode[]; settings?: AppSettings; selectedNodeName?: string }
-    ): Promise<{ success: boolean; error?: string }> => {
+    ): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> => {
       const startOptions = resolveCoreLifecyclePayload(
         payload,
         storageManager.getSettings(),
@@ -290,7 +290,7 @@ export function registerIpcHandlers(
     async (
       _,
       payload: { nodes?: ProxyNode[]; settings?: AppSettings; selectedNodeName?: string }
-    ): Promise<{ success: boolean; error?: string }> => {
+    ): Promise<{ success: boolean; error?: string; warning?: string; tunDowngraded?: boolean }> => {
       const restartOptions = resolveCoreLifecyclePayload(
         payload,
         storageManager.getSettings(),
