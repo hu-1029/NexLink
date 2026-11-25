@@ -16,7 +16,7 @@ dist/
 dist-electron/
 out/
 release/
-build/
+build/*
 !build/installer.nsh
 *.exe
 *.dll
