@@ -98,7 +98,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               className={`relative w-full flex items-center justify-center px-3 py-3 rounded-2xl text-[14.5px] transition-all duration-150 cursor-pointer ${
                 isActive
                   ? 'bg-gradient-to-r from-blue-600 to-blue-500 text-white shadow-md shadow-blue-500/25 font-black'
-                  : 'text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100/90 dark:hover:bg-white/[0.06] hover:translate-x-0.5 font-bold'
+                  : 'glow-card text-slate-800 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100/90 dark:hover:bg-white/[0.06] font-bold'
               }`}
             >
               <div className="flex items-center gap-3">

@@ -788,7 +788,7 @@ export const NodesPage: React.FC = () => {
               className={`p-4 rounded-[20px] transition-all duration-200 cursor-pointer relative group flex flex-col justify-between select-none ${
                 isAutoSelected
                   ? 'bg-blue-50/30 dark:bg-blue-500/10 border-2 border-blue-500 shadow-[0_4px_20px_rgba(37,99,235,0.12)]'
-                  : 'bg-white dark:bg-[#181c26] border border-slate-900/[0.04] dark:border-white/5 shadow-[0_2px_14px_rgba(0,0,0,0.025)] hover:shadow-[0_6px_22px_rgba(0,0,0,0.06)] hover:-translate-y-0.5'
+                  : 'glow-card bg-white dark:bg-[#181c26] shadow-[0_2px_14px_rgba(0,0,0,0.025)]'
               }`}
             >
               <div>
@@ -866,7 +866,7 @@ export const NodesPage: React.FC = () => {
                 className={`p-4 rounded-[20px] transition-all duration-200 cursor-pointer relative group flex flex-col justify-between select-none ${
                   isSelected
                     ? 'bg-blue-50/30 dark:bg-blue-500/10 border-2 border-blue-500 shadow-[0_4px_20px_rgba(37,99,235,0.12)]'
-                    : 'bg-white dark:bg-[#181c26] border border-slate-900/[0.04] dark:border-white/5 shadow-[0_2px_14px_rgba(0,0,0,0.025)] hover:shadow-[0_6px_22px_rgba(0,0,0,0.06)] hover:-translate-y-0.5'
+                    : 'glow-card bg-white dark:bg-[#181c26] shadow-[0_2px_14px_rgba(0,0,0,0.025)]'
                 }`}
               >
                 <div>

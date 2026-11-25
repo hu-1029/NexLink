@@ -400,7 +400,7 @@ export const TestPage: React.FC = () => {
           return (
             <div
               key={item.id}
-              className="p-5 lg:p-6 rounded-2xl bg-white dark:bg-[#181c26] border border-slate-900/[0.05] dark:border-white/5 shadow-[0_2px_16px_rgba(0,0,0,0.03)] hover:shadow-[0_8px_26px_rgba(0,0,0,0.06)] hover:-translate-y-0.5 transition-all flex flex-col justify-between"
+              className="glow-card p-5 lg:p-6 rounded-2xl bg-white dark:bg-[#181c26] shadow-[0_2px_16px_rgba(0,0,0,0.03)] flex flex-col justify-between"
             >
               <div>
                 {/* 顶部服务标题 (加粗放大) 与单项刷新按钮 */}
