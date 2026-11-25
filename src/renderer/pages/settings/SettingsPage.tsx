@@ -91,6 +91,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const [coreState, setCoreState] = useState<{
     isUsingCustomCore: boolean;
     hasBackup: boolean;
+    backupVersion?: string;
     bundledVersion: string;
   }>({ isUsingCustomCore: false, hasBackup: false, bundledVersion: '' });
   const [isUpdatingCore, setIsUpdatingCore] = useState(false);
@@ -106,6 +107,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         setCoreState({
           isUsingCustomCore: st.isUsingCustomCore,
           hasBackup: st.hasBackup,
+          backupVersion: st.backupVersion,
           bundledVersion: st.bundledVersion,
         });
       }
@@ -738,9 +740,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                       loading={isRollingBackCore}
                       disabled={isUpdatingCore}
                       className="text-xs px-2.5 py-1.5 font-bold cursor-pointer shrink-0"
-                      title={coreState.hasBackup ? '回退到上一次更新前的备份版本' : '还原为软件内置稳定版内核'}
+                      title={
+                        coreState.hasBackup
+                          ? `回退到上一版备份 (${coreState.backupVersion || '上一版'})`
+                          : `还原为软件内置稳定版 (${coreState.bundledVersion || 'v1.19.29'})`
+                      }
                     >
-                      {coreState.hasBackup ? '回退' : '还原内置'}
+                      {coreState.hasBackup
+                        ? `回退 ${coreState.backupVersion || ''}`.trim()
+                        : `还原 ${coreState.bundledVersion || '内置'}`.trim()}
                     </Button>
                   )}
                   <Button

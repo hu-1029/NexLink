@@ -436,6 +436,7 @@ export class CoreUpdaterService {
     currentVersion: string;
     isUsingCustomCore: boolean;
     hasBackup: boolean;
+    backupVersion?: string;
     bundledVersion: string;
   } {
     const userMihomoDir = mihomoManager.getUserMihomoDir();
@@ -447,11 +448,13 @@ export class CoreUpdaterService {
       fs.existsSync(userExe) &&
       path.resolve(mihomoManager.getMihomoExePath()).toLowerCase() === path.resolve(userExe).toLowerCase();
     const hasBackup = fs.existsSync(backupExe) && fs.statSync(backupExe).size >= 1024 * 1024;
+    const backupVersion = hasBackup ? mihomoManager.getInstalledCoreVersion(backupExe) || undefined : undefined;
 
     return {
       currentVersion: mihomoManager.getInstalledCoreVersion() || 'v1.19.29',
       isUsingCustomCore,
       hasBackup,
+      backupVersion,
       bundledVersion: mihomoManager.getInstalledCoreVersion(bundledExe) || 'v1.19.29',
     };
   }

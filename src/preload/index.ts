@@ -54,6 +54,7 @@ export const nexlinkAPI = {
       currentVersion: string;
       isUsingCustomCore: boolean;
       hasBackup: boolean;
+      backupVersion?: string;
       bundledVersion: string;
     }> => ipcRenderer.invoke(IPC_CHANNELS.CORE_GET_STATE),
     updateCore: (options?: { force?: boolean }): Promise<{
