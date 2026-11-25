@@ -274,18 +274,13 @@ export class UpdateService {
         const lower = n.toLowerCase();
         return lower.includes('setup') || n.includes('安装');
       };
-      const exeAsset =
-        (isPortable
-          ? exeAssets.find((a: any) => isPortableName(a.name)) ||
-            exeAssets.find((a: any) => !isSetupName(a.name))
-          : exeAssets.find((a: any) => isSetupName(a.name) && !isPortableName(a.name)) ||
-            exeAssets.find((a: any) => !isPortableName(a.name))) ||
-        exeAssets[0] ||
-        assets.find((a: any) => typeof a?.name === 'string' && a.name.toLowerCase().endsWith('.zip')) ||
-        assets[0];
+      const exeAsset = isPortable
+        ? exeAssets.find((a: any) => isPortableName(a.name)) ||
+          exeAssets.find((a: any) => !isSetupName(a.name))
+        : exeAssets.find((a: any) => isSetupName(a.name) && !isPortableName(a.name)) ||
+          exeAssets.find((a: any) => !isPortableName(a.name));
 
-      const assetName =
-        exeAsset?.name || (isPortable ? 'Windows-NexLink-Portable.exe' : 'Windows-NexLink-Setup.exe');
+      const assetName = exeAsset?.name || '';
 
       // 提取预期的 SHA256 完整性哈希（优先 GitHub asset.digest，其次 Release 正文与校验文件）
       let expectedSha256: string | undefined;

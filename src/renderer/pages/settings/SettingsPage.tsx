@@ -502,10 +502,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         setUpdateError(res.error);
       } else if (res.hasUpdate) {
         setPendingUpdateInfo(res);
-        if (!autoUpdate) {
+        if (!res.downloadUrl) {
+          setUpdateError(`发现新版本 v${res.latestVersion}，暂未找到适配当前形态的更新包，请前往发布页查看`);
+          setIsDownloadPromptOpen(true);
+        } else if (!autoUpdate) {
           // 未开启自动更新：弹窗提示用户发现新版本，询问是否立即下载
           setIsDownloadPromptOpen(true);
-        } else if (res.downloadUrl) {
+        } else {
           // 已开启自动更新：自动在后台开始下载
           handleStartDownload(res.downloadUrl);
         }

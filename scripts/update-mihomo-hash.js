@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -19,10 +20,19 @@ const fileBuffer = fs.readFileSync(mihomoPath);
 const sha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex').toUpperCase();
 console.log(`[update-mihomo-hash] resources/mihomo/mihomo.exe SHA-256: ${sha256}`);
 
+let detectedVer = 'v1.19.29';
+try {
+  const verOut = execFileSync(mihomoPath, ['-v'], { encoding: 'utf8', timeout: 3000, windowsHide: true });
+  const m = verOut.match(/v?\d+\.\d+\.\d+(?:-[\w.]+)?/i);
+  if (m) detectedVer = m[0].startsWith('v') ? m[0] : `v${m[0]}`;
+} catch {
+  // fallback
+}
+
 let code = fs.readFileSync(serviceManagerPath, 'utf8');
 const regex = /export const TRUSTED_MIHOMO_BUILTIN_HASHES:\s*Readonly<Record<string,\s*string>>\s*=\s*Object\.freeze\(\{[\s\S]*?\}\);/;
 
-const replacement = `export const TRUSTED_MIHOMO_BUILTIN_HASHES: Readonly<Record<string, string>> = Object.freeze({\n  'v1.19.29-windows-amd64': '${sha256}',\n});`;
+const replacement = `export const TRUSTED_MIHOMO_BUILTIN_HASHES: Readonly<Record<string, string>> = Object.freeze({\n  '${detectedVer}-windows-amd64': '${sha256}',\n});`;
 
 if (!regex.test(code)) {
   console.error('[update-mihomo-hash] Error: Could not locate TRUSTED_MIHOMO_BUILTIN_HASHES in service-manager.ts');
