@@ -37,6 +37,19 @@ export function applyThemeColors(rawBg: string, rawFg: string) {
       box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.08) !important;
     }
 
+    /* 2.1 悬停边缘微亮光动效 (确保不被自定义主题 !important 覆盖) */
+    .glow-card:hover {
+      border-color: rgba(59, 130, 246, 0.55) !important;
+      box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.22), 0 0 18px rgba(59, 130, 246, 0.16), 0 8px 22px -4px rgba(37, 99, 235, 0.14) !important;
+      transform: translateY(-2px);
+    }
+
+    .dark .glow-card:hover {
+      border-color: rgba(96, 165, 250, 0.68) !important;
+      box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.32), 0 0 22px rgba(59, 130, 246, 0.28), 0 8px 24px -4px rgba(37, 99, 235, 0.22) !important;
+      transform: translateY(-2px);
+    }
+
     /* 3. 卡片内部嵌套微容器、输入框、下拉框自适应半透明背景，彻底消除刺眼死白块 */
     [class*="bg-slate-50"]:not(.lan-tooltip-box *),
     [class*="bg-slate-100"]:not(.lan-tooltip-box *):not([class*="bg-blue"]):not([class*="from-blue"]):not(button[class*="text-white"]),
