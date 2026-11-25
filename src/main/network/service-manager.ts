@@ -134,6 +134,18 @@ export interface VerifyMihomoSourceOptions {
   checkSignature?: (filePath: string) => AuthenticodeCheckResult;
 }
 
+export interface VerifiedCoreUpdateProvenance {
+  kind: 'github-release' | 'rollback';
+  downloadUrl?: string;
+  allowedSourceDirs: string[];
+}
+
+export interface SyncUpdatedCoreOptions extends VerifyMihomoSourceOptions {
+  verifiedUpdate?: VerifiedCoreUpdateProvenance;
+  verifyBinaryVersion?: (binPath: string) => string;
+  executePowerShell?: (psPath: string, scriptContent: string) => Promise<string>;
+}
+
 /**
  * 严格解析可信 Mihomo 版本清单 (mihomo-manifest.json)
  */
@@ -1927,14 +1939,16 @@ export class TunServiceManager {
 
   /**
    * 同步更新后的 Mihomo 内核指纹（及已安装服务二进制）到受 SYSTEM/Administrators ACL 保护的特权目录
-   * 解决「内置指纹写死，更新内核后服务安装或启动失败」的问题
+   * 区分「安装/启动校验已有清单」与「主进程在线更新/回退后提权写入新指纹」：
+   * - 始终校验 mihomo.exe 文件名、普通非符号链接文件、>=1MB、PE MZ 头、版本号格式与 SHA-256 一致性；
+   * - 通过 verifyMihomoInstallSource，或经由受控目录 (realpathSync 锁定) + verifiedUpdate 来源凭证 + `-v` 自检放行提权同步。
    */
   public async syncUpdatedCoreToService(
     newBinPath: string,
     version: string,
     expectedSha256: string,
     isAlreadyAdmin: boolean,
-    sourceOptions?: VerifyMihomoSourceOptions
+    sourceOptions?: SyncUpdatedCoreOptions
   ): Promise<{ success: boolean; serviceRestarted?: boolean; error?: string }> {
     if (process.platform !== 'win32') {
       return { success: false, error: '仅 Windows 支持同步特权服务核心指纹' };
@@ -1948,20 +1962,115 @@ export class TunServiceManager {
     if (!fs.existsSync(resolvedBin) || !/^[A-F0-9]{64}$/.test(normalizedHash)) {
       return { success: false, error: '无效的新内核路径或 SHA-256 指纹' };
     }
-
-    // 强制校验新内核安装源可信性（与 installService 同口径：文件名/非符号链接/PE头/ACL或数字签名或可信清单），绝不允许将任意不可信二进制写入 SYSTEM 清单
-    const trustRes = verifyMihomoInstallSource(resolvedBin, sourceOptions);
-    if (!trustRes.trusted || !trustRes.sha256) {
-      return {
-        success: false,
-        error: trustRes.error || '新内核未通过可信来源验证，拒绝同步至特权服务清单',
-      };
+    if (path.basename(resolvedBin).toLowerCase() !== 'mihomo.exe') {
+      return { success: false, error: '可信核心文件名必须为 mihomo.exe' };
     }
-    if (trustRes.sha256.toUpperCase() !== normalizedHash) {
+
+    const binLstat = fs.lstatSync(resolvedBin);
+    if (!binLstat.isFile() || binLstat.isSymbolicLink() || binLstat.size < 1024 * 1024) {
+      return { success: false, error: '新内核文件非法（非普通可执行文件、体积过小或为符号链接）' };
+    }
+
+    const realBinPath = fs.realpathSync(resolvedBin);
+    if (path.basename(realBinPath).toLowerCase() !== 'mihomo.exe') {
+      return { success: false, error: '解析真实路径后核心文件名非法，拒绝同步' };
+    }
+
+    const binBytes = fs.readFileSync(realBinPath);
+    if (binBytes.length < 2 || binBytes[0] !== 0x4d || binBytes[1] !== 0x5a) {
+      return { success: false, error: '新内核缺少合法 PE MZ 文件头' };
+    }
+    const actualSha256 = crypto.createHash('sha256').update(binBytes).digest('hex').toUpperCase();
+    if (actualSha256 !== normalizedHash) {
       return {
         success: false,
         error: '新内核文件实际 SHA-256 与预期指纹不一致，拒绝同步',
       };
+    }
+
+    // 1. 优先尝试已有可信安装源校验（内置清单 / Authenticode 数字签名 / ACL 锁定清单与源目录）
+    const trustRes = verifyMihomoInstallSource(realBinPath, sourceOptions);
+    if (!trustRes.trusted) {
+      // 2. 在线更新 / 回退路径：新版本尚未写入 ProgramData\NexLink\mihomo-manifest.json，
+      //    必须由主进程核心更新器提供受控目录白名单 + 更新来源凭证 + `-v` 可执行自检，绝不放行任意路径伪造二进制
+      const verifiedUpdate = sourceOptions?.verifiedUpdate;
+      if (!verifiedUpdate) {
+        return {
+          success: false,
+          error: trustRes.error || '新内核未通过可信来源验证，拒绝同步至特权服务清单',
+        };
+      }
+
+      const allowedDirs = Array.isArray(verifiedUpdate.allowedSourceDirs)
+        ? verifiedUpdate.allowedSourceDirs.filter((d) => typeof d === 'string' && d.trim().length > 0)
+        : [];
+      if (allowedDirs.length === 0) {
+        return { success: false, error: '未提供受控更新目录白名单，拒绝同步特权服务清单' };
+      }
+
+      const isInsideAllowedDir = allowedDirs.some((dir) => {
+        try {
+          if (!fs.existsSync(dir)) return false;
+          const realDir = fs.realpathSync(path.resolve(dir));
+          const normDir = realDir.toLowerCase();
+          const normBin = realBinPath.toLowerCase();
+          const rel = path.relative(normDir, normBin);
+          return (
+            rel !== '' &&
+            rel !== '..' &&
+            !rel.startsWith('..' + path.sep) &&
+            !rel.startsWith('../') &&
+            !path.isAbsolute(rel)
+          );
+        } catch {
+          return false;
+        }
+      });
+      if (!isInsideAllowedDir) {
+        return {
+          success: false,
+          error: `安全拦截: 新内核路径 (${realBinPath}) 不在主进程受控更新目录内，拒绝提权同步`,
+        };
+      }
+
+      if (verifiedUpdate.kind === 'github-release') {
+        const dlUrl = (verifiedUpdate.downloadUrl || '').trim();
+        if (!/^https:\/\/github\.com\/MetaCubeX\/mihomo\/releases\/download\/.+/i.test(dlUrl)) {
+          return {
+            success: false,
+            error: '安全拦截: 更新来源 URL 非官方 MetaCubeX/mihomo Release 地址，拒绝同步',
+          };
+        }
+      } else if (verifiedUpdate.kind !== 'rollback') {
+        return { success: false, error: '无效的更新来源类型，拒绝同步' };
+      }
+
+      let verOutput = '';
+      try {
+        verOutput = sourceOptions?.verifyBinaryVersion
+          ? sourceOptions.verifyBinaryVersion(realBinPath)
+          : execFileSync(realBinPath, ['-v'], {
+              encoding: 'utf8',
+              timeout: 4000,
+              windowsHide: true,
+            });
+      } catch (verErr: any) {
+        return {
+          success: false,
+          error: `新内核 -v 自检执行失败，拒绝同步: ${verErr?.message || verErr}`,
+        };
+      }
+
+      const normalizedVerNoV = normalizedVersion.replace(/^v/i, '').toLowerCase();
+      if (
+        !/mihomo|clash\.meta/i.test(verOutput) ||
+        !verOutput.toLowerCase().includes(normalizedVerNoV)
+      ) {
+        return {
+          success: false,
+          error: `新内核 -v 版本校验不匹配 (预期 ${normalizedVersion})，拒绝同步`,
+        };
+      }
     }
 
     const tmpDir = path.join(os.tmpdir(), `nexlink-core-sync-${Date.now()}`);
@@ -1971,7 +2080,7 @@ export class TunServiceManager {
     try {
       fs.mkdirSync(tmpDir, { recursive: true });
       const escapedServiceDir = this.serviceDir.replace(/'/g, "''");
-      const escapedNewBin = resolvedBin.replace(/'/g, "''");
+      const escapedNewBin = realBinPath.replace(/'/g, "''");
       const escapedVersion = normalizedVersion.replace(/'/g, "''");
       const escapedResultLog = resultLogPath.replace(/'/g, "''");
       const arch = process.arch === 'arm64' ? 'arm64' : 'amd64';
@@ -2102,6 +2211,14 @@ export class TunServiceManager {
 
       fs.writeFileSync(psPath, '\uFEFF' + syncScript, 'utf8');
       const psSha256 = crypto.createHash('sha256').update(fs.readFileSync(psPath)).digest('hex').toUpperCase();
+
+      if (sourceOptions?.executePowerShell) {
+        const mockRes = await sourceOptions.executePowerShell(psPath, syncScript);
+        if (mockRes.startsWith('OK:')) {
+          return { success: true, serviceRestarted: mockRes === 'OK:RESTARTED' };
+        }
+        return { success: false, error: mockRes || '服务核心指纹同步未返回确认结果' };
+      }
 
       if (isAlreadyAdmin) {
         await execFileAsync(

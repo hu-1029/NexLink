@@ -342,6 +342,9 @@ export class CoreUpdaterService {
         timeout: 4000,
         windowsHide: true,
       });
+      if (!/mihomo|clash\.meta/i.test(verOut)) {
+        throw new Error('提取的可执行文件未通过 Mihomo -v 身份校验');
+      }
       const verMatch = verOut.match(/v?\d+\.\d+\.\d+(?:-[\w.]+)?/i);
       const verifiedVersion = verMatch ? (verMatch[0].startsWith('v') ? verMatch[0] : `v${verMatch[0]}`) : latestTag;
       const newSha256 = crypto.createHash('sha256').update(exeBytes).digest('hex').toUpperCase();
@@ -376,7 +379,14 @@ export class CoreUpdaterService {
         targetExePath,
         verifiedVersion,
         newSha256,
-        isCurrentProcessAdmin()
+        isCurrentProcessAdmin(),
+        {
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl,
+            allowedSourceDirs: [userMihomoDir],
+          },
+        }
       );
 
       // 8. 若之前处于运行状态，自动用新核心重启恢复连接
@@ -522,7 +532,13 @@ export class CoreUpdaterService {
           restoredPath,
           restoredVer,
           restoredSha256,
-          isCurrentProcessAdmin()
+          isCurrentProcessAdmin(),
+          {
+            verifiedUpdate: {
+              kind: 'rollback',
+              allowedSourceDirs: [userMihomoDir, path.dirname(bundledExe)].filter(Boolean),
+            },
+          }
         );
         serviceSynced = syncRes.success;
         syncError = syncRes.error;

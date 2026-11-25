@@ -109,6 +109,142 @@ describe('Batch 2 特权服务 NTFS Owner、内核同步信任、Wintun/Rules �
     }
   });
 
+  it('4. syncUpdatedCoreToService 正向与越权绕过验证：新版本在线更新通过受控来源与 -v 校验后可提权同步，且拒绝越权路径与假来源', async () => {
+    if (process.platform !== 'win32') {
+      return;
+    }
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-sync-positive-'));
+    try {
+      const svcDir = path.join(tmpDir, 'ProgramData', 'NexLink', 'service');
+      const userMihomoDir = path.join(tmpDir, 'userData', 'mihomo');
+      const evilDir = path.join(tmpDir, 'evil');
+      fs.mkdirSync(userMihomoDir, { recursive: true });
+      fs.mkdirSync(evilDir, { recursive: true });
+
+      const newExe = path.join(userMihomoDir, 'mihomo.exe');
+      const newSha = createFakePeBinary(newExe, 'mihomo-v1.20.0-online-update');
+      const evilExe = path.join(evilDir, 'mihomo.exe');
+      const evilSha = createFakePeBinary(evilExe, 'evil-binary');
+
+      const mgr = new TunServiceManager(svcDir);
+
+      // 1) 正向用例：新版本不在内置清单、无 Authenticode 签名、位于普通可写 userData/mihomo，
+      //    但经由在线更新受控来源与 -v 自检验证后，必须顺利进入提权同步脚本而非死锁拒绝！
+      let capturedPsScript = '';
+      const okOnlineRes = await mgr.syncUpdatedCoreToService(
+        newExe,
+        'v1.20.0',
+        newSha,
+        true,
+        {
+          builtinHashes: {},
+          checkAcl: () => ({ locked: false, reason: 'User-writable userData dir', unsafePath: newExe }),
+          checkSignature: () => ({ valid: false, reason: 'NotSigned' }),
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl: 'https://github.com/MetaCubeX/mihomo/releases/download/v1.20.0/mihomo-windows-amd64-v1.20.0.zip',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Mihomo Meta v1.20.0 windows amd64',
+          executePowerShell: async (_psPath, scriptContent) => {
+            capturedPsScript = scriptContent;
+            return 'OK:SYNCED';
+          },
+        }
+      );
+      assert.equal(okOnlineRes.success, true, `合法在线更新应放行提权同步，实际错误: ${okOnlineRes.error}`);
+      assert.ok(capturedPsScript.includes(newSha), '提权脚本必须包含新内核 SHA-256');
+      assert.ok(capturedPsScript.includes('mihomo-manifest.json'), '提权脚本必须写入锁定清单');
+
+      // 2) 正向用例：回退流程 (rollback) 位于受控目录且通过 -v 校验时应放行
+      const okRollbackRes = await mgr.syncUpdatedCoreToService(
+        newExe,
+        'v1.20.0',
+        newSha,
+        true,
+        {
+          builtinHashes: {},
+          checkAcl: () => ({ locked: false, reason: 'User-writable userData dir', unsafePath: newExe }),
+          checkSignature: () => ({ valid: false, reason: 'NotSigned' }),
+          verifiedUpdate: {
+            kind: 'rollback',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Mihomo Meta v1.20.0 windows amd64',
+          executePowerShell: async () => 'OK:RESTARTED',
+        }
+      );
+      assert.equal(okRollbackRes.success, true);
+      assert.equal(okRollbackRes.serviceRestarted, true);
+
+      // 3) 越权拦截：即使伪造 verifiedUpdate，路径不在 allowedSourceDirs 内 -> 必须拦截
+      const resOutsideDir = await mgr.syncUpdatedCoreToService(
+        evilExe,
+        'v1.20.0',
+        evilSha,
+        true,
+        {
+          builtinHashes: {},
+          checkSignature: () => ({ valid: false }),
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl: 'https://github.com/MetaCubeX/mihomo/releases/download/v1.20.0/mihomo-windows-amd64-v1.20.0.zip',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Mihomo Meta v1.20.0 windows amd64',
+          executePowerShell: async () => 'OK:SYNCED',
+        }
+      );
+      assert.equal(resOutsideDir.success, false);
+      assert.match(resOutsideDir.error || '', /不在主进程受控更新目录内/);
+
+      // 4) 越权拦截：非官方 MetaCubeX/mihomo 下载源 URL -> 必须拦截
+      const resBadUrl = await mgr.syncUpdatedCoreToService(
+        newExe,
+        'v1.20.0',
+        newSha,
+        true,
+        {
+          builtinHashes: {},
+          checkSignature: () => ({ valid: false }),
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl: 'https://github.com/attacker/fake/releases/download/v1.20.0/evil.zip',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Mihomo Meta v1.20.0 windows amd64',
+          executePowerShell: async () => 'OK:SYNCED',
+        }
+      );
+      assert.equal(resBadUrl.success, false);
+      assert.match(resBadUrl.error || '', /非官方 MetaCubeX\/mihomo/);
+
+      // 5) 越权拦截：-v 自检输出不匹配 Mihomo 版本 -> 必须拦截
+      const resBadVerOut = await mgr.syncUpdatedCoreToService(
+        newExe,
+        'v1.20.0',
+        newSha,
+        true,
+        {
+          builtinHashes: {},
+          checkSignature: () => ({ valid: false }),
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl: 'https://github.com/MetaCubeX/mihomo/releases/download/v1.20.0/mihomo-windows-amd64-v1.20.0.zip',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Some Fake Binary v9.9.9',
+          executePowerShell: async () => 'OK:SYNCED',
+        }
+      );
+      assert.equal(resBadVerOut.success, false);
+      assert.match(resBadVerOut.error || '', /-v 版本校验不匹配/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('3. C# 服务源码加固校验与 csc.exe 真实编译验证 (Owner校验/回环控制/TUN YAML/日志轮转/恒定时间Token)', () => {
     const cs = generateServiceCSharpSource(33211);
 

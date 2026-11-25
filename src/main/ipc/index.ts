@@ -341,7 +341,7 @@ export function registerIpcHandlers(
     IPC_CHANNELS.CORE_UPDATE,
     async (event, options?: { force?: boolean }) => {
       return await coreUpdaterService.checkAndUpdateCore({
-        ...options,
+        force: Boolean(options?.force),
         onProgress: (msg: string) => {
           try {
             if (!event.sender.isDestroyed()) {
