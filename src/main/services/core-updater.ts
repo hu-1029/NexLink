@@ -352,10 +352,21 @@ export class CoreUpdaterService {
         await mihomoManager.stop();
       }
 
-      // 6. 写入可写的 userData/mihomo/mihomo.exe 并切换 mihomoManager 路径
+      // 6. 自动备份旧版 (mihomo.exe.bak) 后写入可写的 userData/mihomo/mihomo.exe 并切换路径
       const userMihomoDir = mihomoManager.getUserMihomoDir();
       fs.mkdirSync(userMihomoDir, { recursive: true });
       const targetExePath = path.join(userMihomoDir, 'mihomo.exe');
+      const backupExePath = path.join(userMihomoDir, 'mihomo.exe.bak');
+      if (fs.existsSync(targetExePath)) {
+        try {
+          const st = fs.statSync(targetExePath);
+          if (st.isFile() && st.size >= 1024 * 1024) {
+            fs.copyFileSync(targetExePath, backupExePath);
+          }
+        } catch {
+          // ignore backup failure
+        }
+      }
       fs.copyFileSync(newExeTmpPath, targetExePath);
       mihomoManager.setMihomoExePath(targetExePath);
 
@@ -415,6 +426,180 @@ export class CoreUpdaterService {
       } catch {
         // ignore
       }
+    }
+  }
+
+  /**
+   * 获取当前内核状态：是否正在使用在线更新版、是否存在上一版备份、内置版本等
+   */
+  public getCoreState(): {
+    currentVersion: string;
+    isUsingCustomCore: boolean;
+    hasBackup: boolean;
+    bundledVersion: string;
+  } {
+    const userMihomoDir = mihomoManager.getUserMihomoDir();
+    const userExe = path.join(userMihomoDir, 'mihomo.exe');
+    const backupExe = path.join(userMihomoDir, 'mihomo.exe.bak');
+    const bundledExe = mihomoManager.getBundledMihomoExePath();
+
+    const isUsingCustomCore =
+      fs.existsSync(userExe) &&
+      path.resolve(mihomoManager.getMihomoExePath()).toLowerCase() === path.resolve(userExe).toLowerCase();
+    const hasBackup = fs.existsSync(backupExe) && fs.statSync(backupExe).size >= 1024 * 1024;
+
+    return {
+      currentVersion: mihomoManager.getInstalledCoreVersion() || 'v1.19.29',
+      isUsingCustomCore,
+      hasBackup,
+      bundledVersion: mihomoManager.getInstalledCoreVersion(bundledExe) || 'v1.19.29',
+    };
+  }
+
+  /**
+   * 一键回退到上一版备份内核；若无备份则还原为软件内置稳定内核，并同步服务状态
+   */
+  public async rollbackCore(): Promise<CoreUpdateResult> {
+    if (this.isUpdating) {
+      return {
+        success: false,
+        updated: false,
+        currentVersion: mihomoManager.getInstalledCoreVersion() || 'unknown',
+        message: '正在执行内核操作，请稍候...',
+      };
+    }
+
+    this.isUpdating = true;
+    try {
+      const userMihomoDir = mihomoManager.getUserMihomoDir();
+      const userExe = path.join(userMihomoDir, 'mihomo.exe');
+      const backupExe = path.join(userMihomoDir, 'mihomo.exe.bak');
+      const bundledExe = mihomoManager.getBundledMihomoExePath();
+
+      const hasBackup = fs.existsSync(backupExe) && fs.statSync(backupExe).size >= 1024 * 1024;
+      const hasCustom = fs.existsSync(userExe);
+
+      if (!hasBackup && !hasCustom) {
+        return {
+          success: true,
+          updated: false,
+          currentVersion: mihomoManager.getInstalledCoreVersion() || 'v1.19.29',
+          message: '当前已是内置稳定内核，无需回退',
+        };
+      }
+
+      const wasRunning = mihomoManager.getStatus().running;
+      if (wasRunning) {
+        await mihomoManager.stop();
+      }
+
+      let restoredPath = bundledExe;
+      let label = '内置稳定版';
+      if (hasBackup) {
+        fs.copyFileSync(backupExe, userExe);
+        fs.unlinkSync(backupExe);
+        restoredPath = userExe;
+        label = '上一版备份';
+      } else if (hasCustom) {
+        fs.unlinkSync(userExe);
+        restoredPath = bundledExe;
+        label = '内置稳定版';
+      }
+
+      mihomoManager.setMihomoExePath(restoredPath);
+      const restoredVer = mihomoManager.getInstalledCoreVersion(restoredPath) || 'v1.19.29';
+      const bytes = fs.readFileSync(restoredPath);
+      const restoredSha256 = crypto.createHash('sha256').update(bytes).digest('hex').toUpperCase();
+
+      let serviceSynced = true;
+      let syncError: string | undefined;
+      const svcStatus = await tunServiceManager.getServiceStatus();
+      if (svcStatus.installed || restoredPath === userExe) {
+        const syncRes = await tunServiceManager.syncUpdatedCoreToService(
+          restoredPath,
+          restoredVer,
+          restoredSha256,
+          isCurrentProcessAdmin()
+        );
+        serviceSynced = syncRes.success;
+        syncError = syncRes.error;
+      }
+
+      if (wasRunning) {
+        try {
+          const settings = storageManager.getSettings();
+          const nodes = storageManager.getNodes();
+          const state = storageManager.getState();
+          const selectedNodeName =
+            state.selectedNodeName ||
+            (state.activeNodeId ? nodes.find((n) => n.id === state.activeNodeId)?.name : undefined);
+          await mihomoManager.start({ nodes, settings, selectedNodeName });
+        } catch (restartErr: any) {
+          console.warn('[CoreUpdater] 回退后重启核心失败:', restartErr?.message || restartErr);
+        }
+      }
+
+      return {
+        success: true,
+        updated: true,
+        currentVersion: restoredVer,
+        sha256: restoredSha256,
+        serviceSynced,
+        syncError,
+        message: serviceSynced
+          ? `已回退至${label} (${restoredVer})，服务已同步`
+          : `已回退至${label} (${restoredVer})（服务未同步: ${syncError || '未授权'}）`,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        updated: false,
+        currentVersion: mihomoManager.getInstalledCoreVersion() || 'unknown',
+        message: err?.message || '回退内核失败',
+      };
+    } finally {
+      this.isUpdating = false;
+    }
+  }
+
+  /**
+   * 更新 GeoIP / GeoSite 规则库：核心运行时优先走 Mihomo 热更新 API（免重启）；未运行时直接拉取 geoip.metadb
+   */
+  public async updateGeoDatabases(): Promise<{ success: boolean; message: string }> {
+    try {
+      const status = mihomoManager.getStatus();
+      if (status.running) {
+        const apiRes = await mihomoManager.getApiClient().updateGeoDatabases();
+        if (apiRes.ok) {
+          return {
+            success: true,
+            message: 'GeoIP / GeoSite 规则库热更新完成（无需重启核心）',
+          };
+        }
+        throw new Error(apiRes.error || 'Mihomo 热更新 Geo 数据库失败');
+      }
+
+      // 核心未运行时，直接下载最新 geoip.metadb 到运行时目录
+      const runtimeDir = mihomoManager.getRuntimeDir();
+      if (!runtimeDir) {
+        throw new Error('运行时目录未初始化');
+      }
+      const geoUrl = 'https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb';
+      const buf = await fetchBufferSmart(geoUrl, {}, 45000);
+      if (buf.length < 100 * 1024) {
+        throw new Error('下载的 geoip.metadb 文件大小异常，已放弃覆盖');
+      }
+      fs.mkdirSync(runtimeDir, { recursive: true });
+      fs.writeFileSync(path.join(runtimeDir, 'geoip.metadb'), buf);
+      return {
+        success: true,
+        message: `GeoIP 规则库已更新至最新版 (${(buf.length / (1024 * 1024)).toFixed(1)} MB)`,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: err?.message || '更新 Geo 规则库失败，请确认网络或先开启代理后重试',
+      };
     }
   }
 }

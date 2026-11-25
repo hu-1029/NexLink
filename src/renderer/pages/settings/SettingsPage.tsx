@@ -88,13 +88,32 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 
   // 内核版本与在线更新状态
   const [installedCoreVersion, setInstalledCoreVersion] = useState<string>('');
+  const [coreState, setCoreState] = useState<{
+    isUsingCustomCore: boolean;
+    hasBackup: boolean;
+    bundledVersion: string;
+  }>({ isUsingCustomCore: false, hasBackup: false, bundledVersion: '' });
   const [isUpdatingCore, setIsUpdatingCore] = useState(false);
+  const [isRollingBackCore, setIsRollingBackCore] = useState(false);
   const [coreUpdateMsg, setCoreUpdateMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+  const [isUpdatingGeo, setIsUpdatingGeo] = useState(false);
+  const [geoUpdateMsg, setGeoUpdateMsg] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  const refreshCoreState = () => {
+    window.nexlinkAPI?.core?.getCoreState?.().then((st) => {
+      if (st) {
+        if (st.currentVersion) setInstalledCoreVersion(st.currentVersion);
+        setCoreState({
+          isUsingCustomCore: st.isUsingCustomCore,
+          hasBackup: st.hasBackup,
+          bundledVersion: st.bundledVersion,
+        });
+      }
+    }).catch(() => {});
+  };
 
   useEffect(() => {
-    window.nexlinkAPI?.core?.getCoreVersion?.().then((ver) => {
-      if (ver) setInstalledCoreVersion(ver);
-    }).catch(() => {});
+    refreshCoreState();
   }, []);
 
   useEffect(() => {
@@ -107,7 +126,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   }, []);
 
   const handleUpdateCore = async () => {
-    if (!window.nexlinkAPI?.core?.updateCore || isUpdatingCore) return;
+    if (!window.nexlinkAPI?.core?.updateCore || isUpdatingCore || isRollingBackCore) return;
     setIsUpdatingCore(true);
     setCoreUpdateMsg({ text: '正在检查并拉取最新 Mihomo 内核...', type: 'info' });
     try {
@@ -120,7 +139,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
           text: res.message,
           type: res.updated ? 'success' : 'info',
         });
-        // 同步刷新虚拟网卡服务状态
+        refreshCoreState();
         window.nexlinkAPI?.system?.getTunServiceStatus?.().then(setTunServiceStatus).catch(() => {});
       } else {
         setCoreUpdateMsg({ text: res.message || '更新内核失败', type: 'error' });
@@ -129,6 +148,45 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       setCoreUpdateMsg({ text: err?.message || '更新内核失败', type: 'error' });
     } finally {
       setIsUpdatingCore(false);
+    }
+  };
+
+  const handleRollbackCore = async () => {
+    if (!window.nexlinkAPI?.core?.rollbackCore || isUpdatingCore || isRollingBackCore) return;
+    setIsRollingBackCore(true);
+    setCoreUpdateMsg({ text: '正在回退内核版本...', type: 'info' });
+    try {
+      const res = await window.nexlinkAPI.core.rollbackCore();
+      if (res.currentVersion && res.currentVersion !== 'unknown') {
+        setInstalledCoreVersion(res.currentVersion);
+      }
+      setCoreUpdateMsg({
+        text: res.message,
+        type: res.success ? (res.updated ? 'success' : 'info') : 'error',
+      });
+      refreshCoreState();
+      window.nexlinkAPI?.system?.getTunServiceStatus?.().then(setTunServiceStatus).catch(() => {});
+    } catch (err: any) {
+      setCoreUpdateMsg({ text: err?.message || '回退内核失败', type: 'error' });
+    } finally {
+      setIsRollingBackCore(false);
+    }
+  };
+
+  const handleUpdateGeo = async () => {
+    if (!window.nexlinkAPI?.core?.updateGeoDatabases || isUpdatingGeo) return;
+    setIsUpdatingGeo(true);
+    setGeoUpdateMsg({ text: '正在更新 GeoIP / GeoSite 规则库...', type: 'info' });
+    try {
+      const res = await window.nexlinkAPI.core.updateGeoDatabases();
+      setGeoUpdateMsg({
+        text: res.message,
+        type: res.success ? 'success' : 'error',
+      });
+    } catch (err: any) {
+      setGeoUpdateMsg({ text: err?.message || '更新 Geo 规则库失败', type: 'error' });
+    } finally {
+      setIsUpdatingGeo(false);
     }
   };
 
@@ -660,7 +718,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               </div>
             </div>
 
-            {/* Mihomo 内核更新与服务指纹同步 */}
+            {/* Mihomo 内核更新与回退 */}
             <div className="border-t border-slate-100 dark:border-white/5 pt-3">
               <div className="flex items-center justify-between gap-2">
                 <div>
@@ -671,16 +729,32 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     当前版本: {installedCoreVersion || 'v1.19.29'}
                   </span>
                 </div>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={handleUpdateCore}
-                  loading={isUpdatingCore}
-                  className="text-xs px-3 py-1.5 flex items-center gap-1.5 font-bold cursor-pointer shrink-0"
-                  icon={<ArrowUpCircle className="w-3.5 h-3.5" />}
-                >
-                  {isUpdatingCore ? '更新中...' : '更新内核'}
-                </Button>
+                <div className="flex items-center gap-2 shrink-0">
+                  {(coreState.isUsingCustomCore || coreState.hasBackup) && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleRollbackCore}
+                      loading={isRollingBackCore}
+                      disabled={isUpdatingCore}
+                      className="text-xs px-2.5 py-1.5 font-bold cursor-pointer shrink-0"
+                      title={coreState.hasBackup ? '回退到上一次更新前的备份版本' : '还原为软件内置稳定版内核'}
+                    >
+                      {coreState.hasBackup ? '回退' : '还原内置'}
+                    </Button>
+                  )}
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={handleUpdateCore}
+                    loading={isUpdatingCore}
+                    disabled={isRollingBackCore}
+                    className="text-xs px-3 py-1.5 flex items-center gap-1.5 font-bold cursor-pointer shrink-0"
+                    icon={<ArrowUpCircle className="w-3.5 h-3.5" />}
+                  >
+                    {isUpdatingCore ? '更新中...' : '更新内核'}
+                  </Button>
+                </div>
               </div>
               {coreUpdateMsg && (
                 <div
@@ -693,6 +767,43 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   }`}
                 >
                   {coreUpdateMsg.text}
+                </div>
+              )}
+            </div>
+
+            {/* GeoIP / GeoSite 规则库热更新 */}
+            <div className="border-t border-slate-100 dark:border-white/5 pt-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <span className="text-sm font-bold text-slate-800 dark:text-slate-200 block">
+                    GeoIP / GeoSite 规则库
+                  </span>
+                  <span className="text-xs text-slate-400 block mt-0.5">
+                    保持国内外分流规则数据库最新，支持运行时免重启热更新
+                  </span>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleUpdateGeo}
+                  loading={isUpdatingGeo}
+                  className="text-xs px-3 py-1.5 flex items-center gap-1.5 font-bold cursor-pointer shrink-0"
+                  icon={<RefreshCw className="w-3.5 h-3.5" />}
+                >
+                  {isUpdatingGeo ? '更新中...' : '更新规则库'}
+                </Button>
+              </div>
+              {geoUpdateMsg && (
+                <div
+                  className={`mt-2 px-3 py-2 rounded-xl text-xs border ${
+                    geoUpdateMsg.type === 'success'
+                      ? 'bg-emerald-50/80 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-200/60 dark:border-emerald-500/20'
+                      : geoUpdateMsg.type === 'error'
+                      ? 'bg-rose-50/80 dark:bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-200/60 dark:border-rose-500/20'
+                      : 'bg-blue-50/80 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-200/60 dark:border-blue-500/20'
+                  }`}
+                >
+                  {geoUpdateMsg.text}
                 </div>
               )}
             </div>

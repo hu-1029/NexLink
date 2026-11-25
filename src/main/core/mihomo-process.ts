@@ -1709,15 +1709,24 @@ export class MihomoProcessManager {
     return path.join(path.dirname(this.runtimeDir), 'mihomo');
   }
 
+  public getBundledMihomoExePath(): string {
+    return path.join(this.resourcesDir, 'mihomo/mihomo.exe');
+  }
+
+  public getRuntimeDir(): string {
+    return this.runtimeDir;
+  }
+
   /**
-   * 查询当前 mihomo.exe 的真实版本号（例如 v1.19.29）
+   * 查询指定或当前 mihomo.exe 的真实版本号（例如 v1.19.29）
    */
-  public getInstalledCoreVersion(): string {
+  public getInstalledCoreVersion(exePath?: string): string {
     try {
-      if (!this.mihomoExePath || !fs.existsSync(this.mihomoExePath)) {
+      const target = exePath || this.mihomoExePath;
+      if (!target || !fs.existsSync(target)) {
         return '';
       }
-      const out = execFileSync(this.mihomoExePath, ['-v'], {
+      const out = execFileSync(target, ['-v'], {
         encoding: 'utf8',
         timeout: 3000,
         windowsHide: true,

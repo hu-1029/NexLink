@@ -50,6 +50,12 @@ export const nexlinkAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.CORE_SET_MODE, mode),
     getRuntimeConfig: (): Promise<string> => ipcRenderer.invoke(IPC_CHANNELS.CORE_GET_CONFIG),
     getCoreVersion: (): Promise<string> => ipcRenderer.invoke(IPC_CHANNELS.CORE_GET_VERSION),
+    getCoreState: (): Promise<{
+      currentVersion: string;
+      isUsingCustomCore: boolean;
+      hasBackup: boolean;
+      bundledVersion: string;
+    }> => ipcRenderer.invoke(IPC_CHANNELS.CORE_GET_STATE),
     updateCore: (options?: { force?: boolean }): Promise<{
       success: boolean;
       updated: boolean;
@@ -60,6 +66,14 @@ export const nexlinkAPI = {
       syncError?: string;
       message: string;
     }> => ipcRenderer.invoke(IPC_CHANNELS.CORE_UPDATE, options),
+    rollbackCore: (): Promise<{
+      success: boolean;
+      updated: boolean;
+      currentVersion: string;
+      message: string;
+    }> => ipcRenderer.invoke(IPC_CHANNELS.CORE_ROLLBACK),
+    updateGeoDatabases: (): Promise<{ success: boolean; message: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.CORE_UPDATE_GEO),
     onUpdateProgress: (callback: (msg: string) => void) => {
       const listener = (_: any, msg: string) => callback(msg);
       ipcRenderer.on(IPC_CHANNELS.CORE_UPDATE_PROGRESS, listener);

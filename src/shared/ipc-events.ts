@@ -22,7 +22,10 @@ export const IPC_CHANNELS = {
   CORE_GET_CONFIG: 'nexlink:core:get-config',
   CORE_VALIDATE_CONFIG: 'nexlink:core:validate-config',
   CORE_GET_VERSION: 'nexlink:core:get-version',
+  CORE_GET_STATE: 'nexlink:core:get-state',
   CORE_UPDATE: 'nexlink:core:update',
+  CORE_ROLLBACK: 'nexlink:core:rollback',
+  CORE_UPDATE_GEO: 'nexlink:core:update-geo',
   CORE_UPDATE_PROGRESS: 'nexlink:core:update-progress',
 
   // 节点与代理组 API 交互

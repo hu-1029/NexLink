@@ -274,6 +274,26 @@ export class MihomoApiClient {
   }
 
   /**
+   * 触发 Mihomo 热更新 GeoIP / GeoSite / ASN 数据库 (无需重启核心)
+   */
+  async updateGeoDatabases(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await this.fetchWithTimeout(
+        `${this.baseUrl}/configs/geo`,
+        { method: 'POST', body: JSON.stringify({}) },
+        45000
+      );
+      if (res.ok || res.status === 204) {
+        return { ok: true };
+      }
+      const err = await res.json().catch(() => ({}));
+      return { ok: false, error: err.message || `HTTP ${res.status}` };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || '更新 Geo 数据库超时或失败' };
+    }
+  }
+
+  /**
    * 清理代理核心 DNS 解析缓存 (FakeIP 及原生 DNS 缓存)
    */
   async flushDns(): Promise<boolean> {

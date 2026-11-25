@@ -189,6 +189,10 @@ export function registerIpcHandlers(
     return mihomoManager.getInstalledCoreVersion();
   });
 
+  ipcMain.handle(IPC_CHANNELS.CORE_GET_STATE, () => {
+    return coreUpdaterService.getCoreState();
+  });
+
   ipcMain.handle(
     IPC_CHANNELS.CORE_UPDATE,
     async (event, options?: { force?: boolean }) => {
@@ -206,6 +210,14 @@ export function registerIpcHandlers(
       });
     }
   );
+
+  ipcMain.handle(IPC_CHANNELS.CORE_ROLLBACK, async () => {
+    return await coreUpdaterService.rollbackCore();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.CORE_UPDATE_GEO, async () => {
+    return await coreUpdaterService.updateGeoDatabases();
+  });
 
   // 节点与代理组 API 交互
   ipcMain.handle(IPC_CHANNELS.CORE_GET_PROXIES, async () => {
