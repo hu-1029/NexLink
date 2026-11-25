@@ -200,6 +200,7 @@ export interface CoreStatus {
   mode: 'rule' | 'global' | 'direct';
   coreRunMode?: 'service' | 'sidecar';
   tunActive?: boolean;
+  error?: string;
 }
 
 export interface TunServiceStatus {
