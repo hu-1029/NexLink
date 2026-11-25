@@ -123,7 +123,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </nav>
 
       {/* 底部系统信息与驱动提示 */}
-      <div className="p-2.5 px-3 rounded-2xl bg-slate-50/90 dark:bg-white/[0.03] border border-slate-100 dark:border-white/5 flex items-center justify-between text-slate-500 transition-all">
+      <div
+        onClick={() => onSelectTab('settings')}
+        title={`Mihomo (Clash Meta) 代理核心引擎，负责流量代理、分流与 TUN 虚拟网卡转发。当前：${coreRunning ? '运行中' : '已停止'}（点击前往系统设置）`}
+        className="group relative p-2.5 px-3 rounded-2xl bg-slate-50/90 dark:bg-white/[0.03] border border-slate-100 dark:border-white/5 hover:border-blue-500/30 flex items-center justify-between text-slate-500 transition-all cursor-pointer"
+      >
         <div className="flex items-center gap-2">
           <div className="w-5 h-5 rounded-md bg-blue-500/10 dark:bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center">
             <HelpCircle className="w-3 h-3" />
@@ -135,6 +139,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <span className={`text-[10px] font-bold ${coreRunning ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}>
             {coreRunning ? '在线' : '离线'}
           </span>
+        </div>
+
+        {/* 悬停说明浮层 */}
+        <div className="pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 absolute left-0 bottom-full mb-2 w-52 p-2.5 rounded-xl bg-slate-900/95 dark:bg-[#1f2433]/95 text-white text-[11px] leading-relaxed shadow-xl border border-white/10 z-50">
+          <div className="font-bold text-blue-300 mb-0.5">Mihomo 核心驱动</div>
+          <div className="text-slate-200/90">
+            负责底层节点代理、规则分流与 TUN 虚拟网卡流量接管。点击可前往系统设置管理或更新内核。
+          </div>
         </div>
       </div>
     </aside>
