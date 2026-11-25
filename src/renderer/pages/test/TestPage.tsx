@@ -247,7 +247,7 @@ export const TestPage: React.FC = () => {
                 return {
                   ...s,
                   status: 'unlocked',
-                  statusText: '已解锁',
+                  statusText: '可连通',
                   delay,
                   detail: `${delay} ms (${activeCountry})`,
                 };
@@ -267,7 +267,7 @@ export const TestPage: React.FC = () => {
                 return {
                   ...s,
                   status: 'unlocked',
-                  statusText: '已解锁',
+                  statusText: '可连通',
                   delay,
                   detail: `${delay} ms (TW)`,
                 };
@@ -307,7 +307,7 @@ export const TestPage: React.FC = () => {
             return {
               ...s,
               status: 'unlocked',
-              statusText: '已解锁',
+              statusText: '可连通',
               delay,
               detail: `${delay} ms (${activeCountry})`,
             };
@@ -351,9 +351,9 @@ export const TestPage: React.FC = () => {
             解锁测试
           </h1>
 
-          {/* 已解锁统计计数 */}
+          {/* 可连通统计计数 */}
           <span className="text-xs px-2.5 py-1 rounded-full bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 font-bold tabular-nums whitespace-nowrap shrink-0">
-            已解锁 {unlockedCount} / {services.length}
+            可连通 {unlockedCount} / {services.length}
           </span>
 
           {/* 当前测试出站节点徽章 (白底卡片质感，严格截断防撑爆) */}
@@ -437,7 +437,7 @@ export const TestPage: React.FC = () => {
                   {item.status === 'unlocked' && (
                     <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-600 border border-emerald-200/70 dark:bg-emerald-500/15 dark:text-emerald-400 dark:border-emerald-500/20">
                       <CheckCircle2 className="w-4 h-4 stroke-[2.5]" />
-                      <span>{item.statusText || '已解锁'}</span>
+                      <span>{item.statusText || '可连通'}</span>
                     </span>
                   )}
 

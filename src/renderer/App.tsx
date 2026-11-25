@@ -17,7 +17,7 @@ import { Button } from './components/common/Button';
 import { ArrowUpCircle, CheckCircle2, Shield, RefreshCw, AlertCircle } from 'lucide-react';
 import type { UpdateDownloadProgress } from '../shared/types';
 import type { AppInfo, AppSettings, CoreStatus, ThemeMode } from '../shared/types';
-import { applyThemeColors } from './utils/themeManager';
+import { applyThemeColors, getDefaultColorsForTheme } from './utils/themeManager';
 
 export const App: React.FC = () => {
   const VALID_TABS: NavTab[] = ['dashboard', 'subscriptions', 'nodes', 'profiles', 'test', 'logs', 'settings'];
@@ -179,27 +179,36 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, [currentTab]);
 
+  const resolveIsDark = (mode: ThemeMode) =>
+    mode === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches : mode === 'dark';
+
   const applyTheme = (mode: ThemeMode) => {
-    let isDark = false;
-    if (mode === 'system') {
-      isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    } else {
-      isDark = mode === 'dark';
-    }
-    document.documentElement.classList.toggle('dark', isDark);
+    document.documentElement.classList.toggle('dark', resolveIsDark(mode));
   };
 
   const handleSetTheme = (newTheme: ThemeMode) => {
+    const isDark = resolveIsDark(newTheme);
+    const defaults = getDefaultColorsForTheme(isDark ? 'dark' : 'light');
     setTheme(newTheme);
-    applyTheme(newTheme);
-    setSettings((prev) => ({ ...prev, theme: newTheme }));
-    window.nexlinkAPI?.system.updateSettings({ theme: newTheme }).catch(console.error);
+    document.documentElement.classList.toggle('dark', isDark);
+    applyThemeColors(defaults.bg, defaults.fg);
+    setSettings((prev) => ({ ...prev, theme: newTheme, customBg: defaults.bg, customFg: defaults.fg }));
+    window.nexlinkAPI?.system
+      .updateSettings({ theme: newTheme, customBg: defaults.bg, customFg: defaults.fg })
+      .catch(console.error);
   };
 
   const handleToggleTheme = () => {
-    const nextTheme: ThemeMode = theme === 'dark' ? 'light' : 'dark';
-    handleSetTheme(nextTheme);
+    const currentlyDark = resolveIsDark(theme);
+    handleSetTheme(currentlyDark ? 'light' : 'dark');
   };
+
+  // 切换到仪表盘时同步刷新核心状态（确保运行时长等动态指标实时准确）
+  useEffect(() => {
+    if (currentTab === 'dashboard' && window.nexlinkAPI?.core?.getStatus) {
+      window.nexlinkAPI.core.getStatus().then(setCoreStatus).catch(() => {});
+    }
+  }, [currentTab]);
 
   // 监听系统深色/浅色动态变更 (当处于跟随系统模式时即时响应)
   useEffect(() => {

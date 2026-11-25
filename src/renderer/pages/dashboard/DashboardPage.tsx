@@ -188,17 +188,20 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   useEffect(() => {
     let timer: NodeJS.Timeout | null = null;
     if (coreStatus.running) {
-      if (!startTimeRef.current) {
-        startTimeRef.current = Date.now() - (coreStatus.uptime ? coreStatus.uptime * 1000 : 0);
+      const serverUptimeMs = coreStatus.uptime ? coreStatus.uptime * 1000 : 0;
+      if (!startTimeRef.current || serverUptimeMs > 0) {
+        startTimeRef.current = Date.now() - serverUptimeMs;
       }
-      timer = setInterval(() => {
+      const updateUptime = () => {
         if (!startTimeRef.current) return;
-        const elapsedSec = Math.floor((Date.now() - startTimeRef.current) / 1000);
+        const elapsedSec = Math.max(0, Math.floor((Date.now() - startTimeRef.current) / 1000));
         const h = String(Math.floor(elapsedSec / 3600)).padStart(2, '0');
         const m = String(Math.floor((elapsedSec % 3600) / 60)).padStart(2, '0');
         const s = String(elapsedSec % 60).padStart(2, '0');
         setUptimeStr(`${h}:${m}:${s}`);
-      }, 1000);
+      };
+      updateUptime();
+      timer = setInterval(updateUptime, 1000);
     } else {
       startTimeRef.current = null;
       setUptimeStr('00:00:00');
