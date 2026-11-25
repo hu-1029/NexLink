@@ -15,6 +15,8 @@ export class SubscriptionManager {
   private timer: NodeJS.Timeout | null = null;
   private isCheckingScheduled = false;
   private inFlightUpdates = new Map<string, Promise<{ success: boolean; error?: string }>>();
+  private syncInFlightPromise: Promise<ProxyNode[]> | null = null;
+  private syncPendingRerun = false;
   private onDataChangedCallback?: () => void;
   private storage: StorageManager;
   private mihomo: MihomoProcessManager;
@@ -257,9 +259,31 @@ export class SubscriptionManager {
   }
 
   /**
-   * 重新计算聚合节点池，处理去重与当前选中节点失效兜底
+   * 重新计算聚合节点池，处理去重与当前选中节点失效兜底。
+   * 通过单飞锁 + 脏标记合并串行化并发刷新，确保并发调用按序收敛至最新存储态，不会后发先至写入旧配置。
    */
-  public async reaggregateAndSyncCore(): Promise<ProxyNode[]> {
+  public reaggregateAndSyncCore(): Promise<ProxyNode[]> {
+    if (this.syncInFlightPromise) {
+      this.syncPendingRerun = true;
+      return this.syncInFlightPromise;
+    }
+
+    this.syncInFlightPromise = this.runReaggregateSyncLoop().finally(() => {
+      this.syncInFlightPromise = null;
+    });
+    return this.syncInFlightPromise;
+  }
+
+  private async runReaggregateSyncLoop(): Promise<ProxyNode[]> {
+    let latestNodes: ProxyNode[] = [];
+    do {
+      this.syncPendingRerun = false;
+      latestNodes = await this.performReaggregateAndSyncOnce();
+    } while (this.syncPendingRerun);
+    return latestNodes;
+  }
+
+  private async performReaggregateAndSyncOnce(): Promise<ProxyNode[]> {
     const subs = this.storage.getSubscriptions();
     const enabledSubs = subs.filter((s) => s.enabled !== false);
 
@@ -323,20 +347,20 @@ export class SubscriptionManager {
       nextActiveNodeName = existingActiveNode.name;
     }
 
-    // 先立即通知渲染进程刷新订阅与节点列表，再在后台异步热重载 Mihomo 核心，彻底避免前端卡顿等待
+    // 先通知渲染进程刷新订阅与节点列表，再串行等待核心平滑热重载完成，保证后发变更有序合并
     this.onDataChangedCallback?.();
 
     if (this.mihomo.getStatus().running) {
-      console.log('[SubscriptionManager] 节点集或订阅发生变动，后台异步平滑热更新 Mihomo 核心出站节点池...');
-      void this.mihomo
-        .hotReloadOrRestart({
+      console.log('[SubscriptionManager] 节点集或订阅发生变动，串行平滑热更新 Mihomo 核心出站节点池...');
+      try {
+        await this.mihomo.hotReloadOrRestart({
           nodes: aggregated,
           settings: this.storage.getSettings(),
           selectedNodeName: nextActiveNodeName,
-        })
-        .catch((err: any) => {
-          console.warn('[SubscriptionManager] 后台平滑热重载运行核心出站节点警告:', err?.message || err);
         });
+      } catch (err: any) {
+        console.warn('[SubscriptionManager] 平滑热重载运行核心出站节点警告:', err?.message || err);
+      }
     }
 
     return aggregated;

@@ -1,9 +1,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import os from 'os';
-import { fetchSubscription, parseSubscriptionUserInfo } from '../../src/main/subscription/fetcher';
+import {
+  assertSafeRemoteSubscriptionUrl,
+  fetchSubscription,
+  fetchTextWithLimit,
+  parseSubscriptionUserInfo,
+} from '../../src/main/subscription/fetcher';
 import { SAMPLE_BASE64_SUBSCRIPTION } from '../samples/samples';
 
 describe('订阅抓取与解析 fetcher 单元测试', () => {
@@ -140,5 +146,90 @@ describe('订阅抓取与解析 fetcher 单元测试', () => {
     assert.strictEqual(res.success, false);
     assert.ok(res.error && res.error.length > 0);
     assert.strictEqual(res.error.includes('[object Object]'), false);
+  });
+
+  it('7. Batch 5 SSRF 防护：拦截回环/私网/云元数据 IP、IPv6 映射地址、本地域名、DNS 私有解析及 302 内网重定向', async () => {
+    const blockedUrls = [
+      'http://127.0.0.1:8080/sub',
+      'http://169.254.169.254/latest/meta-data/',
+      'http://10.0.0.1/internal',
+      'http://172.16.5.4/internal',
+      'http://192.168.1.1/router',
+      'http://100.64.0.1/cgnat',
+      'http://[::1]:8080/sub',
+      'http://[::ffff:127.0.0.1]/sub',
+      'http://[::ffff:169.254.169.254]/sub',
+      'http://[fe80::1]/sub',
+      'http://[fc00::1]/sub',
+      'http://0x7f.0.0.1/sub',
+      'http://localhost:9090/sub',
+      'http://metadata.internal/sub',
+      'file:///C:/Windows/System32/drivers/etc/hosts',
+      'ftp://example.com/sub',
+    ];
+
+    for (const blocked of blockedUrls) {
+      await assert.rejects(
+        () => assertSafeRemoteSubscriptionUrl(blocked),
+        /安全拦截|不支持|仅支持/,
+        `必须拦截 SSRF 危险地址: ${blocked}`
+      );
+    }
+
+    // 域名解析出私网 IP（DNS Rebinding / 内网域名）也必须拦截
+    await assert.rejects(
+      () =>
+        assertSafeRemoteSubscriptionUrl('https://sub.example.com/v1', false, async () => [
+          { address: '10.10.0.5', family: 4 },
+        ]),
+      /安全拦截/
+    );
+
+    // 公网域名解析出公网 IP 应正常放行
+    const safeParsed = await assertSafeRemoteSubscriptionUrl(
+      'https://sub.example.com/v1',
+      false,
+      async () => [{ address: '93.184.216.34', family: 4 }]
+    );
+    assert.strictEqual(safeParsed.hostname, 'sub.example.com');
+
+    // fetchSubscription 对远程内网地址直接返回安全拦截，不发起网络请求也不重试
+    const directRes = await fetchSubscription('http://169.254.169.254/latest/meta-data/', {
+      retries: 0,
+      timeoutMs: 500,
+    });
+    assert.strictEqual(directRes.success, false);
+    assert.match(directRes.error || '', /安全拦截/);
+
+    // 模拟公网入口 302 重定向到 169.254.169.254：validateUrl 回调必须在第二跳精准拦截
+    const server = http.createServer((_req, res) => {
+      res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data/' });
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as any).port;
+    try {
+      let hopCount = 0;
+      await assert.rejects(
+        () =>
+          fetchTextWithLimit(
+            `http://127.0.0.1:${port}/redir`,
+            {},
+            0,
+            1000,
+            1024 * 1024,
+            10,
+            async (targetUrl) => {
+              hopCount++;
+              // 第一跳允许本地模拟入口，第二跳起严格执行正式 SSRF 校验
+              await assertSafeRemoteSubscriptionUrl(targetUrl, hopCount === 1);
+            }
+          ),
+        /安全拦截/
+      );
+      assert.strictEqual(hopCount, 2, '重定向第二跳必须触发校验并在请求内网前中断');
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

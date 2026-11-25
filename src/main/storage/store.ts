@@ -126,6 +126,9 @@ export class StorageManager {
   }
 
   private atomicWriteJSON(filename: string, data: any): void {
+    if (!this.baseDir) {
+      throw new Error(`StorageManager 尚未初始化存储目录，无法持久化写入 ${filename}`);
+    }
     const filePath = this.getFilePath(filename);
     const uniq = `${Date.now()}_${process.pid}_${Math.random().toString(36).slice(2, 8)}`;
     const tempPath = `${filePath}.tmp_${uniq}`;
@@ -167,12 +170,18 @@ export class StorageManager {
         }
       }
     } catch (err: any) {
-      console.error(`[Storage] 原子写入 ${filename} 异常:`, err.message);
+      console.error(`[Storage] 原子写入 ${filename} 异常:`, err?.message || err);
       try {
         if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
       } catch (cleanErr: any) {
-        console.warn(`[Storage] 清理临时文件失败:`, cleanErr.message);
+        console.warn(`[Storage] 清理临时文件失败:`, cleanErr?.message || cleanErr);
       }
+      try {
+        if (fs.existsSync(bakTmpPath)) fs.unlinkSync(bakTmpPath);
+      } catch {
+        // 忽略备份临时文件清理失败
+      }
+      throw err;
     }
   }
 
@@ -198,7 +207,11 @@ export class StorageManager {
     if (settings.logLevelMigrated && mergedSettings.logLevel === 'warning') {
       mergedSettings.logLevel = 'info';
       mergedSettings.logLevelMigrated = false;
-      this.atomicWriteJSON('settings.json', mergedSettings);
+      try {
+        this.atomicWriteJSON('settings.json', mergedSettings);
+      } catch (err: any) {
+        console.warn('[Storage] 日志级别迁移写盘失败:', err?.message || err);
+      }
     }
 
     this.memoryCache = {
@@ -220,14 +233,15 @@ export class StorageManager {
   }
 
   public saveSettings(newSettings: Partial<AppSettings>): AppSettings {
-    this.memoryCache.settings = {
+    const nextSettings: AppSettings = {
       ...this.memoryCache.settings,
       ...newSettings,
       ...(newSettings.dns
         ? { dns: { ...(this.memoryCache.settings.dns || {}), ...newSettings.dns } as any }
         : {}),
     };
-    this.atomicWriteJSON('settings.json', this.memoryCache.settings);
+    this.atomicWriteJSON('settings.json', nextSettings);
+    this.memoryCache.settings = nextSettings;
     return this.memoryCache.settings;
   }
 
@@ -236,8 +250,8 @@ export class StorageManager {
   }
 
   public saveSubscriptions(subs: ProfileItem[]): void {
-    this.memoryCache.subscriptions = subs;
     this.atomicWriteJSON('subscriptions.json', subs);
+    this.memoryCache.subscriptions = subs;
   }
 
   public getNodes(): ProxyNode[] {
@@ -245,8 +259,8 @@ export class StorageManager {
   }
 
   public saveNodes(nodes: ProxyNode[]): void {
-    this.memoryCache.nodes = nodes;
     this.atomicWriteJSON('nodes.json', nodes);
+    this.memoryCache.nodes = nodes;
   }
 
   public getState(): AppPersistedState {
@@ -254,8 +268,9 @@ export class StorageManager {
   }
 
   public saveState(partialState: Partial<AppPersistedState>): void {
-    this.memoryCache.state = { ...this.memoryCache.state, ...partialState };
-    this.atomicWriteJSON('state.json', this.memoryCache.state);
+    const nextState: AppPersistedState = { ...this.memoryCache.state, ...partialState };
+    this.atomicWriteJSON('state.json', nextState);
+    this.memoryCache.state = nextState;
   }
 
   public getBaseDir(): string {

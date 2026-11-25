@@ -4,7 +4,9 @@
  * subscription-userinfo 协议标头提取与无法获取时明确标记未知
  */
 
+import dns from 'dns';
 import fs from 'fs';
+import net from 'net';
 import path from 'path';
 import type { ParseError, ProfileItem, ProxyNode, SubscriptionUserInfo } from '../../shared/types';
 import { smartParse } from '../../services/importer/smart-importer';
@@ -71,12 +73,188 @@ export function parseSubscriptionUserInfo(headerValue: string | null): Subscript
   return undefined;
 }
 
+export type DnsLookupFn = (
+  hostname: string
+) => Promise<Array<{ address: string; family: number }>>;
+
 export interface FetchOptions {
   timeoutMs?: number;
   retries?: number;
   maxBytes?: number;
   retryDelayMs?: number;
   allowedBaseDir?: string;
+  allowPrivateNetwork?: boolean;
+  lookupFn?: DnsLookupFn;
+}
+
+const MAX_REMOTE_REDIRECTS = 5;
+
+function isPrivateOrReservedIPv4(ip: string): boolean {
+  const parts = ip.split('.').map((p) => Number(p));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+    return true;
+  }
+  const [a, b, c] = parts;
+  if (a === 0) return true; // 0.0.0.0/8 未指定网段
+  if (a === 10) return true; // 10.0.0.0/8 私网
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
+  if (a === 127) return true; // 127.0.0.0/8 回环
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 链路本地与云元数据 (169.254.169.254)
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 私网
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return true; // 192.0.0.0/24 & TEST-NET-1
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16 私网
+  if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 基准测试
+  if (a === 198 && b === 51 && c === 100) return true; // 198.51.100.0/24 TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return true; // 203.0.113.0/24 TEST-NET-3
+  if (a >= 224) return true; // 224.0.0.0/4 组播与 240.0.0.0/4 保留地址
+  return false;
+}
+
+function parseIPv6Hextets(rawIp: string): number[] | null {
+  let addr = rawIp.toLowerCase();
+  const lastColon = addr.lastIndexOf(':');
+  if (lastColon !== -1 && addr.slice(lastColon + 1).includes('.')) {
+    const ipv4Part = addr.slice(lastColon + 1);
+    const octets = ipv4Part.split('.').map((p) => Number(p));
+    if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) {
+      return null;
+    }
+    const hi = ((octets[0] << 8) | octets[1]).toString(16);
+    const lo = ((octets[2] << 8) | octets[3]).toString(16);
+    addr = `${addr.slice(0, lastColon)}:${hi}:${lo}`;
+  }
+
+  const halves = addr.split('::');
+  if (halves.length > 2) return null;
+
+  const parseSide = (side: string): number[] | null => {
+    if (!side) return [];
+    const tokens = side.split(':');
+    const nums: number[] = [];
+    for (const token of tokens) {
+      if (!/^[0-9a-f]{1,4}$/.test(token)) return null;
+      nums.push(parseInt(token, 16));
+    }
+    return nums;
+  };
+
+  if (halves.length === 1) {
+    const groups = parseSide(halves[0]);
+    return groups && groups.length === 8 ? groups : null;
+  }
+
+  const left = parseSide(halves[0]);
+  const right = parseSide(halves[1]);
+  if (!left || !right) return null;
+  const zeroCount = 8 - left.length - right.length;
+  if (zeroCount < 1) return null;
+  return [...left, ...Array<number>(zeroCount).fill(0), ...right];
+}
+
+function hextetsToIPv4(hi: number, lo: number): string {
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
+export function isPrivateOrReservedIp(rawIp: string): boolean {
+  const cleaned = rawIp.trim().replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+  const family = net.isIP(cleaned);
+  if (family === 4) {
+    return isPrivateOrReservedIPv4(cleaned);
+  }
+  if (family === 6) {
+    const h = parseIPv6Hextets(cleaned);
+    if (!h) return true;
+    const isAllZero = h.every((g) => g === 0);
+    if (isAllZero) return true; // ::
+    const isLoopback = h.slice(0, 7).every((g) => g === 0) && h[7] === 1;
+    if (isLoopback) return true; // ::1
+
+    // IPv4-mapped (::ffff:0:0/96) / IPv4-compatible (::/96) / NAT64 (64:ff9b::/96)
+    const isMappedV4 = h.slice(0, 5).every((g) => g === 0) && h[5] === 0xffff;
+    const isCompatV4 = h.slice(0, 6).every((g) => g === 0);
+    const isNat64 = h[0] === 0x0064 && h[1] === 0xff9b && h.slice(2, 6).every((g) => g === 0);
+    if (isMappedV4 || isCompatV4 || isNat64) {
+      return isPrivateOrReservedIPv4(hextetsToIPv4(h[6], h[7]));
+    }
+
+    if ((h[0] & 0xfe00) === 0xfc00) return true; // fc00::/7 ULA
+    if ((h[0] & 0xffc0) === 0xfe80) return true; // fe80::/10 链路本地
+    if ((h[0] & 0xffc0) === 0xfec0) return true; // fec0::/10 站点本地
+    if ((h[0] & 0xff00) === 0xff00) return true; // ff00::/8 组播
+    if (h[0] === 0x2002) {
+      return isPrivateOrReservedIPv4(hextetsToIPv4(h[1], h[2])); // 6to4 内嵌 IPv4
+    }
+    if (h[0] === 0x2001 && (h[1] === 0x0000 || h[1] === 0x0db8)) return true; // Teredo / Documentation
+    return false;
+  }
+  return true;
+}
+
+function createSsrfError(message: string): Error & { noRetry: boolean } {
+  const err = new Error(message) as Error & { noRetry: boolean };
+  err.noRetry = true;
+  return err;
+}
+
+/**
+ * 校验远程订阅 URL 安全性：仅允许 http/https，并拦截回环、私网、云元数据及本地内部域名（SSRF 防护）
+ */
+export async function assertSafeRemoteSubscriptionUrl(
+  rawUrl: string,
+  allowPrivateNetwork: boolean = false,
+  lookupFn?: DnsLookupFn
+): Promise<URL> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    throw createSsrfError(`无效的远程订阅 URL: ${rawUrl || '未提供'}`);
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw createSsrfError(`安全拦截: 远程订阅仅支持 HTTP/HTTPS 协议，已拒绝 ${parsed.protocol}`);
+  }
+
+  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+  if (!hostname) {
+    throw createSsrfError('无效的远程订阅 URL: 缺少主机名');
+  }
+
+  if (allowPrivateNetwork) {
+    return parsed;
+  }
+
+  if (
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal')
+  ) {
+    throw createSsrfError(`安全拦截: 远程订阅禁止访问本地或内网保留域名 (${hostname})`);
+  }
+
+  if (net.isIP(hostname) !== 0) {
+    if (isPrivateOrReservedIp(hostname)) {
+      throw createSsrfError(`安全拦截: 远程订阅禁止访问回环、私网或保留 IP 地址 (${hostname})`);
+    }
+    return parsed;
+  }
+
+  const resolve =
+    lookupFn || ((host: string) => dns.promises.lookup(host, { all: true, verbatim: true }));
+  const records = await resolve(hostname);
+  if (!records || records.length === 0) {
+    throw new Error(`无法解析远程订阅域名: ${hostname}`);
+  }
+  for (const rec of records) {
+    if (isPrivateOrReservedIp(rec.address)) {
+      throw createSsrfError(
+        `安全拦截: 远程订阅域名 ${hostname} 解析到了禁止访问的私网/保留 IP (${rec.address})`
+      );
+    }
+  }
+
+  return parsed;
 }
 
 function isPathInsideDir(parentDir: string, childPath: string): boolean {
@@ -161,20 +339,49 @@ export async function fetchTextWithLimit(
   retries: number = 1,
   timeoutMs: number = 15000,
   maxBytes: number = 10 * 1024 * 1024, // 10MB 安全上限
-  retryDelayMs: number = 1000
+  retryDelayMs: number = 1000,
+  validateUrl?: (targetUrl: string) => Promise<void>
 ): Promise<{ text: string; headers: Headers }> {
   let lastError: any = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
-    // 整个下载生命周期（含 HTTP 握手、响应标头及全部响应体数据流传输）受全局超时严格保护，彻底防止挂起卡死
+    // 整个下载生命周期（含 HTTP 握手、重定向校验、响应标头及响应体数据流传输）受全局超时严格保护，彻底防止挂起卡死
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const response = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-      });
+      let currentUrl = url;
+      let response: Response | null = null;
+
+      for (let hop = 0; hop <= MAX_REMOTE_REDIRECTS; hop++) {
+        if (validateUrl) {
+          await validateUrl(currentUrl);
+        }
+
+        response = await fetch(currentUrl, {
+          ...options,
+          redirect: 'manual',
+          signal: controller.signal,
+        });
+
+        if (response.status >= 300 && response.status < 400) {
+          const location = response.headers.get('location');
+          await response.body?.cancel().catch(() => {});
+          if (!location) {
+            throw createSsrfError(`远程订阅重定向缺少 Location 标头 (HTTP ${response.status})`);
+          }
+          if (hop >= MAX_REMOTE_REDIRECTS) {
+            throw createSsrfError(`远程订阅重定向次数超过上限 (${MAX_REMOTE_REDIRECTS})`);
+          }
+          currentUrl = new URL(location, currentUrl).toString();
+          continue;
+        }
+        break;
+      }
+
+      if (!response) {
+        throw new Error('未能获取有效的远程响应');
+      }
 
       if (!response.ok) {
         const error: any = new Error(`HTTP 状态码异常: ${response.status} ${response.statusText}`);
@@ -369,14 +576,20 @@ export async function fetchSubscription(
     };
   }
 
-  // 2. 远程 HTTP/HTTPS 订阅拉取
-  if (!sub.url || !/^https?:\/\//i.test(sub.url.trim())) {
+  // 2. 远程 HTTP/HTTPS 订阅拉取（含协议校验与 SSRF 防护）
+  if (!sub.url || !sub.url.trim()) {
     return {
       success: false,
       nodes: [],
       error: `无效的远程订阅 URL: ${sub.url || '未提供'}`,
     };
   }
+
+  const allowPrivateNetwork = options?.allowPrivateNetwork === true;
+  const lookupFn = options?.lookupFn;
+  const validateRemoteUrl = async (targetUrl: string): Promise<void> => {
+    await assertSafeRemoteSubscriptionUrl(targetUrl, allowPrivateNetwork, lookupFn);
+  };
 
   const timeoutMs = options?.timeoutMs ?? 15000;
   const retries = options?.retries ?? 1;
@@ -385,7 +598,7 @@ export async function fetchSubscription(
 
   try {
     const { text: rawContent, headers } = await fetchTextWithLimit(
-      sub.url,
+      sub.url.trim(),
       {
         headers: {
           'User-Agent': USER_AGENT,
@@ -395,7 +608,8 @@ export async function fetchSubscription(
       retries,
       timeoutMs,
       maxBytes,
-      retryDelayMs
+      retryDelayMs,
+      validateRemoteUrl
     );
 
     // 提取服务商流量与到期信息标头 (大小写不敏感)

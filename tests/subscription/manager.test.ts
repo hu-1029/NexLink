@@ -96,8 +96,124 @@ describe('订阅生命周期管理 SubscriptionManager 单元测试', () => {
     assert.strictEqual(storage.getState().activeNodeId, '');
   });
 
+  it('5. 并发触发 reaggregateAndSyncCore 时串行排队并合并至最新存储态，不出现旧配置覆盖', async () => {
+    const syncDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink_test_sync_serial_'));
+    const syncStorage = new StorageManager(syncDir);
+    const reloadCalls: string[][] = [];
+    let inFlightHotReloads = 0;
+    let maxConcurrentHotReloads = 0;
+    let releaseFirstReload!: () => void;
+    let notifyFirstStarted!: () => void;
+    const firstReloadStarted = new Promise<void>((resolve) => {
+      notifyFirstStarted = resolve;
+    });
+
+    const mockSyncMihomo = {
+      getStatus: () => ({ running: true }),
+      hotReloadOrRestart: async (opts: { nodes: Array<{ id: string }> }) => {
+        inFlightHotReloads++;
+        maxConcurrentHotReloads = Math.max(maxConcurrentHotReloads, inFlightHotReloads);
+        reloadCalls.push(opts.nodes.map((n) => n.id));
+        if (reloadCalls.length === 1) {
+          notifyFirstStarted();
+          await new Promise<void>((res) => {
+            releaseFirstReload = res;
+          });
+        } else {
+          await new Promise<void>((res) => setTimeout(res, 15));
+        }
+        inFlightHotReloads--;
+        return { success: true };
+      },
+    } as unknown as MihomoProcessManager;
+
+    try {
+      syncStorage.saveSubscriptions([
+        {
+          id: 'sub-a',
+          name: 'sub-a',
+          type: 'remote',
+          url: 'https://example.com/a',
+          nodeCount: 1,
+          updatedAt: '',
+          status: 'ok',
+          enabled: true,
+          nodes: [
+            {
+              id: 'node-a',
+              name: 'Node A',
+              type: 'vless',
+              server: 'a.example.com',
+              port: 443,
+              subscriptionId: 'sub-a',
+            },
+          ],
+        },
+        {
+          id: 'sub-b',
+          name: 'sub-b',
+          type: 'remote',
+          url: 'https://example.com/b',
+          nodeCount: 1,
+          updatedAt: '',
+          status: 'ok',
+          enabled: true,
+          nodes: [
+            {
+              id: 'node-b',
+              name: 'Node B',
+              type: 'vless',
+              server: 'b.example.com',
+              port: 443,
+              subscriptionId: 'sub-b',
+            },
+          ],
+        },
+      ]);
+
+      const syncManager = new SubscriptionManager(syncStorage, mockSyncMihomo);
+      const p1 = syncManager.reaggregateAndSyncCore();
+      await firstReloadStarted;
+
+      // 第一次热重载还在进行时，快速修改订阅状态并连续并发触发两次 reaggregateAndSyncCore
+      const updatedSubs = syncStorage.getSubscriptions().map((s) =>
+        s.id === 'sub-b'
+          ? {
+              ...s,
+              nodes: [
+                {
+                  id: 'node-b-v2',
+                  name: 'Node B v2',
+                  type: 'vless',
+                  server: 'b2.example.com',
+                  port: 443,
+                  subscriptionId: 'sub-b',
+                },
+              ],
+            }
+          : s
+      );
+      syncStorage.saveSubscriptions(updatedSubs);
+      const p2 = syncManager.reaggregateAndSyncCore();
+      const p3 = syncManager.reaggregateAndSyncCore();
+
+      // 放行第一次热重载，等待全部排队任务收敛
+      releaseFirstReload();
+      const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+      assert.strictEqual(maxConcurrentHotReloads, 1, '绝不允许并发同时下发多个 hotReloadOrRestart');
+      // 多次后续触发应当合并，并且最后一次提交的一定是最新节点集 node-a + node-b-v2
+      assert.strictEqual(reloadCalls.length, 2, '两次排队变更应合并为单次尾随重载');
+      assert.deepStrictEqual(reloadCalls[1], ['node-a', 'node-b-v2']);
+      assert.deepStrictEqual(r1.map((n) => n.id), ['node-a', 'node-b-v2']);
+      assert.deepStrictEqual(r2.map((n) => n.id), ['node-a', 'node-b-v2']);
+      assert.deepStrictEqual(r3.map((n) => n.id), ['node-a', 'node-b-v2']);
+    } finally {
+      fs.rmSync(syncDir, { recursive: true, force: true });
+    }
+  });
+
   // 测试完成清理
-  it('5. 清理测试产生的临时文件', () => {
+  it('6. 清理测试产生的临时文件', () => {
     try {
       fs.rmSync(testDir, { recursive: true, force: true });
     } catch {

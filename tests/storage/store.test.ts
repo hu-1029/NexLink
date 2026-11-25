@@ -74,8 +74,51 @@ describe('持久化存储 StorageManager 单元测试', () => {
     assert.strictEqual(reloaded.getState().activeNodeId, 'node-1');
   });
 
+  it('4. 写入磁盘失败时应抛出异常且 memoryCache 绝不脏写偏离磁盘状态', () => {
+    // 1) 未初始化存储目录时写盘直接抛错且内存不提交
+    const uninitStore = new StorageManager();
+    const prevMixedPort = uninitStore.getSettings().mixedPort;
+    assert.throws(
+      () => uninitStore.saveSettings({ mixedPort: 9999 }),
+      /尚未初始化存储目录/,
+      '未初始化存储写入必须上抛异常'
+    );
+    assert.strictEqual(uninitStore.getSettings().mixedPort, prevMixedPort, '写盘失败不得污染内存 settings');
+
+    // 2) 目标 JSON 文件被同名目录占用导致写入/替换失败时，抛出异常且 memoryCache 保持原值
+    const failDir = path.join(os.tmpdir(), `nexlink_test_storage_fail_${Date.now()}`);
+    const failStore = new StorageManager(failDir);
+    try {
+      failStore.saveSettings({ mixedPort: 7895 });
+      failStore.saveNodes([]);
+      failStore.saveState({ activeNodeId: 'node-orig' });
+
+      // 将目标文件替换成目录，强制 renameSync / copyFileSync 落盘失败
+      for (const name of ['settings.json', 'nodes.json', 'state.json']) {
+        const target = path.join(failDir, name);
+        fs.rmSync(target, { recursive: true, force: true });
+        fs.mkdirSync(target);
+      }
+
+      assert.throws(() => failStore.saveSettings({ mixedPort: 6666 }));
+      assert.strictEqual(failStore.getSettings().mixedPort, 7895, 'settings 写入失败必须回滚/保持旧值');
+
+      assert.throws(() =>
+        failStore.saveNodes([
+          { id: 'dirty', name: 'dirty', type: 'vless', server: '1.1.1.1', port: 443 },
+        ])
+      );
+      assert.strictEqual(failStore.getNodes().length, 0, 'nodes 写入失败不得保留脏内存状态');
+
+      assert.throws(() => failStore.saveState({ activeNodeId: 'dirty-id' }));
+      assert.strictEqual(failStore.getState().activeNodeId, 'node-orig', 'state 写入失败不得修改内存状态');
+    } finally {
+      fs.rmSync(failDir, { recursive: true, force: true });
+    }
+  });
+
   // 测试后清理临时目录
-  it('4. 安全清理临时存储目录', () => {
+  it('5. 安全清理临时存储目录', () => {
     try {
       fs.rmSync(testDir, { recursive: true, force: true });
     } catch {

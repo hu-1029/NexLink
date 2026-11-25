@@ -329,24 +329,41 @@ export class MihomoApiClient {
   }
 
   /**
-   * 10. 启动流式实时流量监控（SSE 流或轮询降级）
+   * 启动带初始连接握手超时保护的 NDJSON/SSE 流读取器
    */
-  startTrafficStream(
-    onData: (data: MihomoTrafficData) => void,
-    onError?: (err: Error) => void
+  private startJsonLineStream<T>(
+    endpointPath: string,
+    errorLabel: string,
+    onData: (data: T) => void,
+    onError?: (err: Error) => void,
+    connectTimeoutMs: number = 5000
   ): () => void {
     const controller = new AbortController();
     let isAborted = false;
+    let timedOut = false;
 
     const connectStream = async () => {
+      let handshakeTimer: NodeJS.Timeout | null = null;
       try {
-        const response = await fetch(`${this.baseUrl}/traffic`, {
+        if (connectTimeoutMs > 0) {
+          handshakeTimer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, connectTimeoutMs);
+        }
+
+        const response = await fetch(`${this.baseUrl}${endpointPath}`, {
           headers: this.getHeaders(),
           signal: controller.signal,
         });
 
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+
         if (!response.ok || !response.body) {
-          throw new Error(`无法连接流量流: HTTP ${response.status}`);
+          throw new Error(`无法连接${errorLabel}: HTTP ${response.status}`);
         }
 
         const reader = response.body.getReader();
@@ -365,7 +382,7 @@ export class MihomoApiClient {
             const trimmed = line.trim();
             if (!trimmed) continue;
             try {
-              const data = JSON.parse(trimmed) as MihomoTrafficData;
+              const data = JSON.parse(trimmed) as T;
               onData(data);
             } catch {
               // 忽略解析错误行
@@ -373,13 +390,21 @@ export class MihomoApiClient {
           }
         }
       } catch (err: any) {
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
         if (!isAborted) {
-          onError?.(err);
+          if (timedOut) {
+            onError?.(new Error(`${errorLabel}连接超时 (${connectTimeoutMs}ms)`));
+          } else {
+            onError?.(err instanceof Error ? err : new Error(String(err?.message || err)));
+          }
         }
       }
     };
 
-    connectStream();
+    void connectStream();
 
     return () => {
       isAborted = true;
@@ -388,62 +413,37 @@ export class MihomoApiClient {
   }
 
   /**
+   * 10. 启动流式实时流量监控（SSE 流或轮询降级）
+   */
+  startTrafficStream(
+    onData: (data: MihomoTrafficData) => void,
+    onError?: (err: Error) => void,
+    connectTimeoutMs: number = 5000
+  ): () => void {
+    return this.startJsonLineStream<MihomoTrafficData>(
+      '/traffic',
+      '流量流',
+      onData,
+      onError,
+      connectTimeoutMs
+    );
+  }
+
+  /**
    * 11. 启动流式实时日志监控 (SSE /logs)
    */
   startLogStream(
     level: string = 'info',
     onData: (data: { type: string; payload: string }) => void,
-    onError?: (err: Error) => void
+    onError?: (err: Error) => void,
+    connectTimeoutMs: number = 5000
   ): () => void {
-    const controller = new AbortController();
-    let isAborted = false;
-
-    const connectStream = async () => {
-      try {
-        const response = await fetch(`${this.baseUrl}/logs?level=${encodeURIComponent(level)}`, {
-          headers: this.getHeaders(),
-          signal: controller.signal,
-        });
-
-        if (!response.ok || !response.body) {
-          throw new Error(`无法连接日志流: HTTP ${response.status}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (!isAborted) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              const data = JSON.parse(trimmed) as { type: string; payload: string };
-              onData(data);
-            } catch {
-              // 忽略解析错误
-            }
-          }
-        }
-      } catch (err: any) {
-        if (!isAborted) {
-          onError?.(err);
-        }
-      }
-    };
-
-    connectStream();
-
-    return () => {
-      isAborted = true;
-      controller.abort();
-    };
+    return this.startJsonLineStream<{ type: string; payload: string }>(
+      `/logs?level=${encodeURIComponent(level)}`,
+      '日志流',
+      onData,
+      onError,
+      connectTimeoutMs
+    );
   }
 }

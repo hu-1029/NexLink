@@ -296,6 +296,7 @@ describe('6项核心修复专项真实代码验证 (Six Fixes Real Execution Tes
         timeoutMs,
         retries: 1,
         retryDelayMs: 20,
+        allowPrivateNetwork: true,
       });
 
       assert.strictEqual(resHang.success, false);
@@ -319,6 +320,7 @@ describe('6项核心修复专项真实代码验证 (Six Fixes Real Execution Tes
         timeoutMs: 1000,
         retries: 1,
         retryDelayMs: 20,
+        allowPrivateNetwork: true,
       });
 
       assert.strictEqual(res404.success, false);
@@ -337,6 +339,7 @@ describe('6项核心修复专项真实代码验证 (Six Fixes Real Execution Tes
         timeoutMs: 1000,
         retries: 0,
         maxBytes: 1024,
+        allowPrivateNetwork: true,
       });
       assert.strictEqual(resOversizeHeader.success, false);
       assert.ok(
@@ -349,6 +352,7 @@ describe('6项核心修复专项真实代码验证 (Six Fixes Real Execution Tes
         timeoutMs: 1000,
         retries: 0,
         maxBytes: 1024, // 1KB 上限，实际发送 16KB
+        allowPrivateNetwork: true,
       });
       assert.strictEqual(resOversizeBody.success, false);
       assert.ok(
