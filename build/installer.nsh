@@ -46,7 +46,7 @@
           RMDir /r "$4\NexLink"
         ${endIf}
       ${else}
-        ExecShellWait "runas" "powershell.exe" '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "sc.exe stop NexLinkCoreService | Out-Null; for ($$i=0; $$i -lt 20; $$i++) { $$s = (sc.exe query NexLinkCoreService | Out-String); if ($$LASTEXITCODE -ne 0 -or $$s -match ''STOPPED'') { break }; Start-Sleep -Milliseconds 500 }; sc.exe delete NexLinkCoreService | Out-Null; Start-Sleep -Milliseconds 300; if ($$env:ProgramData) { $$d = Join-Path $$env:ProgramData ''NexLink''; if (Test-Path $$d) { Remove-Item -LiteralPath $$d -Recurse -Force -ErrorAction SilentlyContinue } }"' SW_HIDE
+        ExecShellWait "runas" "powershell.exe" '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "sc.exe stop NexLinkCoreService | Out-Null; for ($$i=0; $$i -lt 20; $$i++) { $$s = (sc.exe query NexLinkCoreService | Out-String); if ($$LASTEXITCODE -ne 0 -or $$s -match $\'STOPPED$\') { break }; Start-Sleep -Milliseconds 500 }; sc.exe delete NexLinkCoreService | Out-Null; Start-Sleep -Milliseconds 300; if ($$env:ProgramData) { $$d = Join-Path $$env:ProgramData $\'NexLink$\'; if (Test-Path $$d) { Remove-Item -LiteralPath $$d -Recurse -Force -ErrorAction SilentlyContinue } }"' SW_HIDE
       ${endIf}
     ${endIf}
   ${endIf}

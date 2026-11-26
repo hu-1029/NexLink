@@ -176,7 +176,7 @@ describe('Batch 7 系统代理恢复完整性、ProxyGuard 备份还原与 NSIS 
     }
   });
 
-  it('4. build/installer.nsh 包含 ProgramData ($4) 非空保护并轮询 STOPPED 后再删除服务', () => {
+  it('4. build/installer.nsh 包含 ProgramData ($4) 非空保护、轮询 STOPPED 且提权 PowerShell 命令经真实 AST 解析 0 语法错误', () => {
     const nsh = fs.readFileSync(path.resolve('build/installer.nsh'), 'utf8');
     const codeOnly = nsh
       .split(/\r?\n/)
@@ -185,5 +185,42 @@ describe('Batch 7 系统代理恢复完整性、ProxyGuard 备份还原与 NSIS 
     assert.ok(codeOnly.includes('${if} $4 != ""'), '卸载脚本必须判断 ProgramData ($4) 非空后再操作目录');
     assert.ok(codeOnly.includes('STOPPED'), '卸载脚本必须轮询 sc.exe query 是否进入 STOPPED 状态');
     assert.strictEqual(/^\s*Sleep\s+1000\b/m.test(codeOnly), false, '不应再依赖固定 Sleep 1000 盲删服务');
+
+    const psExecLine = nsh
+      .split(/\r?\n/)
+      .find((line) => line.includes('ExecShellWait') && line.includes('powershell.exe'));
+    assert.ok(psExecLine, '非管理员分支必须包含 ExecShellWait powershell.exe 调用');
+    assert.strictEqual(psExecLine!.includes("''"), false, "NSIS 单引号字符串中禁止使用 '' 转义单引号");
+
+    const cmdMatch = psExecLine!.match(/-Command\s+"([\s\S]+)"'\s+SW_HIDE/);
+    assert.ok(cmdMatch && cmdMatch[1], '必须能提取传给 powershell.exe -Command 的参数体');
+
+    // 按 NSIS 单引号字符串展开规则还原: $$ -> $, $\' -> '
+    const expandedPsCode = cmdMatch![1].replace(/\$\$/g, '$').replace(/\$\\'/g, "'");
+    assert.ok(expandedPsCode.includes("-match 'STOPPED'"));
+    assert.ok(expandedPsCode.includes("Join-Path $env:ProgramData 'NexLink'"));
+
+    if (process.platform === 'win32') {
+      const codeB64 = Buffer.from(expandedPsCode, 'utf8').toString('base64');
+      const parseCheckScript = `
+$code = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${codeB64}'))
+$tokens = $null
+$errors = $null
+[void][System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
+if ($errors -and $errors.Count -gt 0) {
+  $msgs = ($errors | ForEach-Object { $_.Message }) -join '; '
+  Write-Error "PowerShell AST parse errors: $msgs"
+  exit 1
+}
+Write-Output 'AST_OK'
+`;
+      const encodedCheck = Buffer.from(parseCheckScript, 'utf16le').toString('base64');
+      const out = execFileSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encodedCheck],
+        { encoding: 'utf8', windowsHide: true, timeout: 10000 }
+      );
+      assert.strictEqual(out.trim(), 'AST_OK');
+    }
   });
 });
