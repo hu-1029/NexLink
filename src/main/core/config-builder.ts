@@ -13,7 +13,6 @@ export interface BuildConfigOptions {
   settings: AppSettings;
   apiSecret: string;
   selectedNodeName?: string;
-  activeProfileContent?: string; // 如果用户直接使用现有配置文件的 YAML 内容
 }
 
 export function buildMihomoConfig(options: BuildConfigOptions): string {

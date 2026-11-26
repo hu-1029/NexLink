@@ -20,7 +20,6 @@ export const IPC_CHANNELS = {
   CORE_RESTART: 'nexlink:core:restart',
   CORE_SET_MODE: 'nexlink:core:set-mode',
   CORE_GET_CONFIG: 'nexlink:core:get-config',
-  CORE_VALIDATE_CONFIG: 'nexlink:core:validate-config',
   CORE_GET_VERSION: 'nexlink:core:get-version',
   CORE_GET_STATE: 'nexlink:core:get-state',
   CORE_UPDATE: 'nexlink:core:update',

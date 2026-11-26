@@ -37,7 +37,7 @@ export const MOCK_SUBSCRIPTIONS: ProfileItem[] = [
     id: 'sub-03',
     name: '本地混合导入节点集',
     type: 'local',
-    filePath: 'C:\\Users\\20122\\Desktop\\my_custom_nodes.yaml',
+    filePath: '/profiles/custom-nodes.yaml',
     nodeCount: 6,
     updatedAt: '2026-11-01 12:00',
     status: 'ok',

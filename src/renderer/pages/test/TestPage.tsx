@@ -197,7 +197,8 @@ function getDisplayNodeName(nodeName: string): string {
 }
 
 export const TestPage: React.FC = () => {
-  const { nodes, activeNodeId } = useProxyStore();
+  const nodes = useProxyStore((s) => s.nodes);
+  const activeNodeId = useProxyStore((s) => s.activeNodeId);
   const activeNode = nodes.find((n) => n.id === activeNodeId) || nodes[0];
   const { countryCode: activeCountry } = getNodeCountry(activeNode || {});
   const activeNodeName = activeNode?.name || '默认代理链路';

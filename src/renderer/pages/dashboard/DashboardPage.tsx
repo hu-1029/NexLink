@@ -65,8 +65,13 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   onRestartCore,
   onChangeMode,
 }) => {
-  const { nodes, activeNodeId, groups, testAllDelays, isTestingSpeed } = useProxyStore();
-  const { subscriptions, activeSubscriptionId } = useProfileStore();
+  const nodes = useProxyStore((s) => s.nodes);
+  const activeNodeId = useProxyStore((s) => s.activeNodeId);
+  const groups = useProxyStore((s) => s.groups);
+  const testAllDelays = useProxyStore((s) => s.testAllDelays);
+  const isTestingSpeed = useProxyStore((s) => s.isTestingSpeed);
+  const subscriptions = useProfileStore((s) => s.subscriptions);
+  const activeSubscriptionId = useProfileStore((s) => s.activeSubscriptionId);
 
   const isTunActive = typeof settings?.tunMode === 'boolean' ? settings.tunMode : false;
   const isAllowLanActive = typeof settings?.allowLan === 'boolean' ? settings.allowLan : false;

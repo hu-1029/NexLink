@@ -28,7 +28,7 @@ const BASE_RULES = [
 
 export const ProfilesPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'rules' | 'dns' | 'yaml'>('rules');
-  const { chains } = useProxyStore();
+  const chains = useProxyStore((s) => s.chains);
 
   // 分流规则状态
   const [customRules, setCustomRules] = useState<string[]>([

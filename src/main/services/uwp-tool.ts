@@ -71,6 +71,42 @@ async function isRunningAsAdmin(): Promise<boolean> {
 }
 
 /**
+ * 解析 PowerShell UTF-8 注册表查询输出的 JSON 列表并映射为标准 UwpAppItem[]
+ */
+export function parseUwpAppsJsonOutput(stdout: string, exemptSids: Set<string>): UwpAppItem[] {
+  const trimmed = stdout.trim();
+  if (!trimmed) return [];
+
+  const parsed = JSON.parse(trimmed) as
+    | { sid?: string; displayName?: string; moniker?: string }
+    | Array<{ sid?: string; displayName?: string; moniker?: string }>;
+  const rawList = Array.isArray(parsed) ? parsed : [parsed];
+
+  const appsMap = new Map<string, UwpAppItem>();
+  for (const item of rawList) {
+    const sid = (item?.sid || '').trim();
+    if (!sid.startsWith('S-1-15-2-')) continue;
+    const rawDisplayName = (item?.displayName || '').trim();
+    const moniker = (item?.moniker || '').trim();
+    if (!moniker && !rawDisplayName) continue;
+
+    const cleanMoniker = moniker || sid;
+    const friendlyName = resolveFriendlyName(cleanMoniker, rawDisplayName);
+    appsMap.set(sid, {
+      sid,
+      packageFamilyName: cleanMoniker,
+      displayName: friendlyName,
+      isExempt: exemptSids.has(sid),
+    });
+  }
+
+  return Array.from(appsMap.values()).sort((a, b) => {
+    if (a.isExempt !== b.isExempt) return a.isExempt ? -1 : 1;
+    return a.displayName.localeCompare(b.displayName, 'zh-CN');
+  });
+}
+
+/**
  * 批量执行 CheckNetIsolation 命令 (支持已有管理员权限直接执行或通过 PowerShell 提权执行)
  */
 async function executeLoopbackSids(action: 'clear-and-add' | 'add-only' | 'clear-only', sids: string[]): Promise<boolean> {
@@ -82,12 +118,18 @@ async function executeLoopbackSids(action: 'clear-and-add' | 'add-only' | 'clear
       await execFileAsync('CheckNetIsolation.exe', ['LoopbackExempt', '-c'], { windowsHide: true, timeout: 10000 });
     }
     if (action === 'clear-and-add' || action === 'add-only') {
+      const failures: string[] = [];
       for (const sid of safeSids) {
         try {
           await execFileAsync('CheckNetIsolation.exe', ['LoopbackExempt', '-a', `-p=${sid}`], { windowsHide: true, timeout: 10000 });
         } catch (err: any) {
-          console.warn('[UwpTool] 添加豁免失败:', sid, err.message);
+          const msg = err?.stderr?.trim() || err?.message || '未知错误';
+          console.warn('[UwpTool] 添加豁免失败:', sid, msg);
+          failures.push(`${sid}: ${msg}`);
         }
+      }
+      if (failures.length > 0) {
+        throw new Error(`部分 UWP 应用豁免添加失败 (${failures.length}/${safeSids.length}): ${failures[0]}`);
       }
     }
     return true;
@@ -95,15 +137,17 @@ async function executeLoopbackSids(action: 'clear-and-add' | 'add-only' | 'clear
 
   const innerLines: string[] = [];
   if (action === 'clear-and-add' || action === 'clear-only') {
-    innerLines.push('& CheckNetIsolation.exe LoopbackExempt -c | Out-Null');
+    innerLines.push('& CheckNetIsolation.exe LoopbackExempt -c | Out-Null; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }');
   }
   if ((action === 'clear-and-add' || action === 'add-only') && safeSids.length > 0) {
     const sidList = safeSids.map((s) => `'${s}'`).join(',');
-    innerLines.push(`foreach ($s in @(${sidList})) { & CheckNetIsolation.exe LoopbackExempt -a "-p=$s" | Out-Null }`);
+    innerLines.push(
+      `$failed = 0; foreach ($s in @(${sidList})) { & CheckNetIsolation.exe LoopbackExempt -a "-p=$s" | Out-Null; if ($LASTEXITCODE -ne 0) { $failed++ } }; if ($failed -gt 0) { exit 1 }`
+    );
   }
   if (innerLines.length === 0) return true;
   const innerEncoded = Buffer.from(innerLines.join('\n'), 'utf16le').toString('base64');
-  const launcher = `Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','${innerEncoded}' -Verb RunAs -Wait -WindowStyle Hidden`;
+  const launcher = `$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','${innerEncoded}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; if ($proc.ExitCode -ne 0) { throw "CheckNetIsolation 返回异常退出码: $($proc.ExitCode)" }`;
   const launcherEncoded = Buffer.from(launcher, 'utf16le').toString('base64');
 
   try {
@@ -118,7 +162,7 @@ async function executeLoopbackSids(action: 'clear-and-add' | 'add-only' | 'clear
     if (err.message && err.message.toLowerCase().includes('canceled')) {
       throw new Error('用户取消了管理员权限授权');
     }
-    throw new Error(`执行失败: ${err.message}`);
+    throw new Error(`执行失败: ${err?.stderr?.trim() || err.message}`);
   }
 }
 
@@ -148,59 +192,30 @@ export class UwpToolService {
         console.warn('[UwpTool] 获取已豁免列表异常:', err.message);
       }
 
-      // 2. 查询注册表中的所有 AppContainer Mappings
-      const appsMap = new Map<string, UwpAppItem>();
+      // 2. 通过 PowerShell UTF-8 读取注册表 AppContainer Mappings，彻底解决中文 Windows 下 reg query GBK/OEM 编码导致的 DisplayName 乱码
+      const psScript = [
+        '$OutputEncoding = [System.Text.Encoding]::UTF8',
+        '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+        "$path = 'HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings'",
+        '$items = @(Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object {',
+        '  $props = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue',
+        '  [PSCustomObject]@{ sid = $_.PSChildName; displayName = [string]$props.DisplayName; moniker = [string]$props.Moniker }',
+        '})',
+        'ConvertTo-Json -InputObject @($items) -Compress',
+      ].join('\n');
+      const psEncoded = Buffer.from(psScript, 'utf16le').toString('base64');
+
       try {
-        const { stdout: regOutput } = await execAsync(
-          'reg query "HKCU\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings" /s',
-          { windowsHide: true, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
+        const { stdout: regJsonOutput } = await execFileAsync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', psEncoded],
+          { windowsHide: true, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024, timeout: 10000 }
         );
-
-        const sections = regOutput.split(
-          /HKEY_CURRENT_USER\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppContainer\\Mappings\\/i
-        );
-
-        for (const sec of sections) {
-          const lines = sec.trim().split('\n');
-          if (lines.length < 2) continue;
-          const sid = lines[0].trim();
-          if (!sid.startsWith('S-1-15-2-')) continue;
-
-          let rawDisplayName = '';
-          let moniker = '';
-
-          for (const line of lines) {
-            if (line.includes('DisplayName')) {
-              const parts = line.trim().split(/\s{2,}REG_SZ\s{2,}/);
-              if (parts.length > 1) rawDisplayName = parts[1].trim();
-            } else if (line.includes('Moniker')) {
-              const parts = line.trim().split(/\s{2,}REG_SZ\s{2,}/);
-              if (parts.length > 1) moniker = parts[1].trim();
-            }
-          }
-
-          if (moniker || rawDisplayName) {
-            const cleanMoniker = moniker || sid;
-            const friendlyName = resolveFriendlyName(cleanMoniker, rawDisplayName);
-            const isExempt = exemptSids.has(sid);
-
-            appsMap.set(sid, {
-              sid,
-              packageFamilyName: cleanMoniker,
-              displayName: friendlyName,
-              isExempt,
-            });
-          }
-        }
+        return parseUwpAppsJsonOutput(regJsonOutput, exemptSids);
       } catch (err: any) {
         console.warn('[UwpTool] 查询 AppContainer 注册表失败:', err.message);
+        return [];
       }
-
-      // 3. 排序：已豁免靠前，随后按中文友好名称字母序排序
-      return Array.from(appsMap.values()).sort((a, b) => {
-        if (a.isExempt !== b.isExempt) return a.isExempt ? -1 : 1;
-        return a.displayName.localeCompare(b.displayName, 'zh-CN');
-      });
     } catch (err: any) {
       console.error('[UwpTool] 获取 UWP 应用异常:', err);
       return [];

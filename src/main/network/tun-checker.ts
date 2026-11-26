@@ -145,6 +145,23 @@ export async function checkTunPrerequisites(): Promise<TunCheckResult> {
 }
 
 /**
+ * 构造提权重启 PowerShell 命令脚本：dev 模式下使用 -EncodedCommand 包装内层命令，彻底避免空格与嵌套单引号冲突
+ */
+export function buildRestartAsAdminPsScript(options: {
+  isPackaged: boolean;
+  execPath: string;
+  cwd: string;
+}): string {
+  const psEscape = (s: string) => s.replace(/'/g, "''");
+  if (options.isPackaged) {
+    return `Start-Process -FilePath '${psEscape(options.execPath)}' -ArgumentList '--relaunch' -Verb RunAs`;
+  }
+  const innerCmd = `Set-Location -LiteralPath '${psEscape(options.cwd)}'; npm run dev`;
+  const innerEncoded = Buffer.from(innerCmd, 'utf16le').toString('base64');
+  return `Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-WindowStyle','Hidden','-EncodedCommand','${innerEncoded}' -Verb RunAs`;
+}
+
+/**
  * 兜底选项：以 Windows 管理员权限重新拉起 NexLink 客户端 (严禁黑框弹窗)
  */
 export async function restartAsAdmin(options?: {
@@ -160,11 +177,11 @@ export async function restartAsAdmin(options?: {
   const mihomo = options?.mihomo ?? mihomoManager;
 
   try {
-    const psEscape = (s: string) => s.replace(/'/g, "''");
-    const exePath = process.execPath;
-    const psScript = appInst?.isPackaged
-      ? `Start-Process -FilePath '${psEscape(exePath)}' -ArgumentList '--relaunch' -Verb RunAs`
-      : `Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile','-WindowStyle','Hidden','-Command','Set-Location -LiteralPath '${psEscape(process.cwd())}'; npm run dev' -Verb RunAs`;
+    const psScript = buildRestartAsAdminPsScript({
+      isPackaged: Boolean(appInst?.isPackaged),
+      execPath: process.execPath,
+      cwd: process.cwd(),
+    });
     const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
 
     // 先触发 UAC 提权拉起新实例（新实例 --relaunch 具备 10s 单实例锁等待窗口），避免用户取消 UAC 时已断开当前代理

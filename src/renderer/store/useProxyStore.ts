@@ -13,6 +13,15 @@ export const DEFAULT_PROXY_GROUPS: ProxyGroupTab[] = [
   { id: 'chain', name: '🔗 链式代理', type: 'select' },
 ];
 
+export function formatChainOutboundName(name: string): string {
+  const trimmed = name.trim();
+  return trimmed.startsWith('🔗') ? trimmed : `🔗 ${trimmed}`;
+}
+
+export function normalizeChainName(name: string): string {
+  return name.replace(/^🔗\s*/, '').trim();
+}
+
 interface ProxyStore {
   nodes: ProxyNode[];
   groups: ProxyGroupTab[];
@@ -130,9 +139,21 @@ export const useProxyStore = create<ProxyStore>((set, get) => ({
       set({ activeNodeId: '', activeChainId: '', activeOutboundMode: 'auto', selectedOutboundName: '⚡ 自动选择' });
       return;
     }
-    const matchedChain = selectedNodeName ? state.chains.find((c) => c.name === selectedNodeName) : undefined;
+    const matchedChain = selectedNodeName
+      ? state.chains.find(
+          (c) =>
+            c.name === selectedNodeName ||
+            formatChainOutboundName(c.name) === selectedNodeName ||
+            normalizeChainName(c.name) === normalizeChainName(selectedNodeName)
+        )
+      : undefined;
     if (matchedChain) {
-      set({ activeNodeId: '', activeChainId: matchedChain.id, activeOutboundMode: 'chain', selectedOutboundName: matchedChain.name });
+      set({
+        activeNodeId: '',
+        activeChainId: matchedChain.id,
+        activeOutboundMode: 'chain',
+        selectedOutboundName: formatChainOutboundName(matchedChain.name),
+      });
       return;
     }
     const node = state.nodes.find((n) => n.id === id) || (selectedNodeName ? state.nodes.find((n) => n.name === selectedNodeName) : undefined);
@@ -184,7 +205,7 @@ export const useProxyStore = create<ProxyStore>((set, get) => ({
   },
 
   setActiveChain: async (chain) => {
-    const chainGroupName = chain.name.startsWith('🔗') ? chain.name : `🔗 ${chain.name}`;
+    const chainGroupName = formatChainOutboundName(chain.name);
     set({
       activeChainId: chain.id,
       activeNodeId: '',

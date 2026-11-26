@@ -14,10 +14,15 @@ import { useProxyStore } from './store/useProxyStore';
 import { useProfileStore } from './store/useProfileStore';
 import { Modal } from './components/common/Modal';
 import { Button } from './components/common/Button';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { ArrowUpCircle, CheckCircle2, Shield, RefreshCw, AlertCircle } from 'lucide-react';
 import type { UpdateDownloadProgress } from '../shared/types';
 import type { AppInfo, AppSettings, CoreStatus, ThemeMode } from '../shared/types';
-import { applyThemeColors, getDefaultColorsForTheme } from './utils/themeManager';
+import { applyThemeColors, getDefaultColorsForTheme, resolveIsDark } from './utils/themeManager';
+
+function applyThemeToDocument(mode: ThemeMode, systemPrefersDark?: boolean): void {
+  document.documentElement.classList.toggle('dark', resolveIsDark(mode, systemPrefersDark));
+}
 
 export const App: React.FC = () => {
   const VALID_TABS: NavTab[] = ['dashboard', 'subscriptions', 'nodes', 'profiles', 'test', 'logs', 'settings'];
@@ -25,6 +30,11 @@ export const App: React.FC = () => {
   const initialTab: NavTab = rawTab && VALID_TABS.includes(rawTab) ? rawTab : 'dashboard';
   const [currentTab, setCurrentTab] = useState<NavTab>(initialTab);
   const [theme, setTheme] = useState<ThemeMode>('dark');
+  const [systemDark, setSystemDark] = useState<boolean>(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+      : true
+  );
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [coreStatus, setCoreStatus] = useState<CoreStatus>({
     running: false,
@@ -55,8 +65,12 @@ export const App: React.FC = () => {
   const [isInstallingTunService, setIsInstallingTunService] = useState(false);
   const [tunServiceModalError, setTunServiceModalError] = useState<string | null>(null);
 
-  const { nodes, activeNodeId, setNodes, setChains } = useProxyStore();
-  const { subscriptions, setSubscriptions, setActiveSubscription } = useProfileStore();
+  const nodeCount = useProxyStore((s) => s.nodes.length);
+  const setNodes = useProxyStore((s) => s.setNodes);
+  const setChains = useProxyStore((s) => s.setChains);
+  const subCount = useProfileStore((s) => s.subscriptions.length);
+  const setSubscriptions = useProfileStore((s) => s.setSubscriptions);
+  const setActiveSubscription = useProfileStore((s) => s.setActiveSubscription);
 
   // 初始化从 Electron 主进程获取系统与核心状态，加载持久化数据
   useEffect(() => {
@@ -91,7 +105,7 @@ export const App: React.FC = () => {
           if (persisted.settings) {
             if (persisted.settings.theme) {
               setTheme(persisted.settings.theme);
-              applyTheme(persisted.settings.theme);
+              applyThemeToDocument(persisted.settings.theme);
             }
             if (persisted.settings.customBg && persisted.settings.customFg) {
               applyThemeColors(persisted.settings.customBg, persisted.settings.customFg);
@@ -179,15 +193,8 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, [currentTab]);
 
-  const resolveIsDark = (mode: ThemeMode) =>
-    mode === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches : mode === 'dark';
-
-  const applyTheme = (mode: ThemeMode) => {
-    document.documentElement.classList.toggle('dark', resolveIsDark(mode));
-  };
-
   const handleSetTheme = (newTheme: ThemeMode) => {
-    const isDark = resolveIsDark(newTheme);
+    const isDark = resolveIsDark(newTheme, systemDark);
     const defaults = getDefaultColorsForTheme(isDark ? 'dark' : 'light');
     setTheme(newTheme);
     document.documentElement.classList.toggle('dark', isDark);
@@ -199,7 +206,7 @@ export const App: React.FC = () => {
   };
 
   const handleToggleTheme = () => {
-    const currentlyDark = resolveIsDark(theme);
+    const currentlyDark = resolveIsDark(theme, systemDark);
     handleSetTheme(currentlyDark ? 'light' : 'dark');
   };
 
@@ -212,16 +219,17 @@ export const App: React.FC = () => {
 
   // 监听系统深色/浅色动态变更 (当处于跟随系统模式时即时响应)
   useEffect(() => {
-    applyTheme(theme);
-    if (theme === 'system') {
+    applyThemeToDocument(theme, systemDark);
+    if (theme === 'system' && typeof window.matchMedia === 'function') {
       const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
       const listener = (e: MediaQueryListEvent) => {
+        setSystemDark(e.matches);
         document.documentElement.classList.toggle('dark', e.matches);
       };
       mediaQuery.addEventListener('change', listener);
       return () => mediaQuery.removeEventListener('change', listener);
     }
-  }, [theme]);
+  }, [theme, systemDark]);
 
   const handleToggleTun = async (val: boolean) => {
     if (!window.nexlinkAPI?.system) {
@@ -358,7 +366,7 @@ export const App: React.FC = () => {
     const store = useProxyStore.getState();
     if (store.activeOutboundMode === 'auto') return '⚡ 自动选择';
     if (store.activeOutboundMode === 'chain' && store.selectedOutboundName) return store.selectedOutboundName;
-    const activeNode = nodes.find((n) => n.id === activeNodeId) || nodes[0];
+    const activeNode = store.nodes.find((n) => n.id === store.activeNodeId) || store.nodes[0];
     return activeNode?.name;
   };
 
@@ -375,7 +383,7 @@ export const App: React.FC = () => {
         setCoreStatus((prev) => ({ ...prev, running: false, tunActive: false }));
       } else {
         const res = await window.nexlinkAPI.core.start({
-          nodes,
+          nodes: useProxyStore.getState().nodes,
           selectedNodeName: resolveSelectedOutboundName(),
         });
         if (!res.success) {
@@ -405,7 +413,7 @@ export const App: React.FC = () => {
     setIsCoreBusy(true);
     try {
       const res = await window.nexlinkAPI.core.restart({
-        nodes,
+        nodes: useProxyStore.getState().nodes,
         selectedNodeName: resolveSelectedOutboundName(),
       });
       if (!res.success) {
@@ -441,7 +449,7 @@ export const App: React.FC = () => {
   return (
     <div
       className={`w-screen h-screen flex flex-col ${
-        theme === 'dark' ? 'dark bg-[#0e1117] text-slate-100' : 'bg-[#f2f4f8] text-slate-800'
+        resolveIsDark(theme, systemDark) ? 'dark bg-[#0e1117] text-slate-100' : 'bg-[#f2f4f8] text-slate-800'
       }`}
     >
       {/* 现代 Windows 无边框原生标题栏 */}
@@ -458,20 +466,21 @@ export const App: React.FC = () => {
         <Sidebar
           currentTab={currentTab}
           onSelectTab={setCurrentTab}
-          nodeCount={nodes.length}
-          subCount={subscriptions.length}
+          nodeCount={nodeCount}
+          subCount={subCount}
           coreRunning={coreStatus.running}
         />
 
         {/* 右侧主视窗内容区 */}
         <main className="flex-1 h-[calc(100vh-2.5rem)] overflow-y-auto p-6">
-          <Suspense
-            fallback={
-              <div className="flex items-center justify-center h-full text-slate-400">
-                <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-              </div>
-            }
-          >
+          <ErrorBoundary resetKey={currentTab} onReset={() => setCurrentTab('dashboard')}>
+            <Suspense
+              fallback={
+                <div className="flex items-center justify-center h-full text-slate-400">
+                  <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                </div>
+              }
+            >
             {currentTab === 'dashboard' && (
               <DashboardPage
                 coreStatus={coreStatus}
@@ -520,6 +529,7 @@ export const App: React.FC = () => {
               />
             )}
           </Suspense>
+          </ErrorBoundary>
         </main>
         <ToastContainer />
 

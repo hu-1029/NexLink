@@ -3,7 +3,19 @@
  * 动态注入全局 CSS 规则，使背景色与前景色在整个应用（包含 body, #root, main, 标题及前景色）秒级生效
  */
 
+import type { ThemeMode } from '../../shared/types';
+
 const SAFE_HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+export function resolveIsDark(mode: ThemeMode, systemPrefersDark?: boolean): boolean {
+  if (mode === 'system') {
+    if (typeof systemPrefersDark === 'boolean') return systemPrefersDark;
+    return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+      : true;
+  }
+  return mode === 'dark';
+}
 
 export function applyThemeColors(rawBg: string, rawFg: string) {
   if (typeof document === 'undefined') return;
