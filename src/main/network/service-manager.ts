@@ -333,54 +333,63 @@ export function verifyMihomoInstallSource(
     : path.join(path.dirname(resolvedBin), TRUSTED_MIHOMO_MANIFEST_FILENAME);
 
   const tryVerifyManifestFile = (manifestFilePath: string, requireBinAcl: boolean): MihomoSourceTrustResult | null => {
-    if (!fs.existsSync(manifestFilePath)) return null;
-    const manifestStat = fs.lstatSync(manifestFilePath);
-    if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
-      return {
-        trusted: false,
-        sha256: actualSha256,
-        error: 'mihomo-manifest.json 非法（非普通文件或为符号链接）',
-      };
-    }
-    if (requireBinAcl) {
-      const binAcl = checkAclFn(resolvedBin);
-      if (!binAcl.locked) {
+    try {
+      if (!fs.existsSync(manifestFilePath)) return null;
+      const manifestStat = fs.lstatSync(manifestFilePath);
+      if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
         return {
           trusted: false,
-          error: `mihomo.exe 安装源或其父目录 ACL 不安全（普通用户可写，拒绝信任）: ${binAcl.unsafePath || resolvedBin} (${binAcl.reason || 'ACL unlocked'})`,
+          sha256: actualSha256,
+          error: 'mihomo-manifest.json 非法（非普通文件或为符号链接）',
         };
       }
-    }
-    const manifestAcl = checkAclFn(manifestFilePath);
-    if (!manifestAcl.locked) {
+      if (requireBinAcl) {
+        const binAcl = checkAclFn(resolvedBin);
+        if (!binAcl.locked) {
+          return {
+            trusted: false,
+            error: `mihomo.exe 安装源或其父目录 ACL 不安全（普通用户可写，拒绝信任）: ${binAcl.unsafePath || resolvedBin} (${binAcl.reason || 'ACL unlocked'})`,
+          };
+        }
+      }
+      const manifestAcl = checkAclFn(manifestFilePath);
+      if (!manifestAcl.locked) {
+        return {
+          trusted: false,
+          sha256: actualSha256,
+          error: `mihomo-manifest.json 或其父目录 ACL 不安全（普通用户可写，拒绝信任清单）: ${manifestAcl.unsafePath || manifestFilePath}`,
+        };
+      }
+      const manifest = parseTrustedMihomoManifest(fs.readFileSync(manifestFilePath, 'utf8'));
+      if (!manifest) {
+        return {
+          trusted: false,
+          sha256: actualSha256,
+          error: 'mihomo-manifest.json 格式无效，无法验证安装源可信性',
+        };
+      }
+      const matched = manifest.entries.find((e) => e.sha256 === actualSha256);
+      if (matched) {
+        return {
+          trusted: true,
+          sha256: actualSha256,
+          matchedVersion: matched.version,
+          trustMethod: 'external-manifest',
+          manifestPath: manifestFilePath,
+        };
+      }
+      return null;
+    } catch (err: any) {
       return {
         trusted: false,
         sha256: actualSha256,
-        error: `mihomo-manifest.json 或其父目录 ACL 不安全（普通用户可写，拒绝信任清单）: ${manifestAcl.unsafePath || manifestFilePath}`,
+        error: `读取可信内核清单失败 (${manifestFilePath}): ${err?.message || '无访问权限或文件异常'}`,
       };
     }
-    const manifest = parseTrustedMihomoManifest(fs.readFileSync(manifestFilePath, 'utf8'));
-    if (!manifest) {
-      return {
-        trusted: false,
-        sha256: actualSha256,
-        error: 'mihomo-manifest.json 格式无效，无法验证安装源可信性',
-      };
-    }
-    const matched = manifest.entries.find((e) => e.sha256 === actualSha256);
-    if (matched) {
-      return {
-        trusted: true,
-        sha256: actualSha256,
-        matchedVersion: matched.version,
-        trustMethod: 'external-manifest',
-        manifestPath: manifestFilePath,
-      };
-    }
-    return null;
   };
 
   // 3a. 优先检查应用内更新内核后同步到系统特权目录的 ACL 锁定清单 (ProgramData\NexLink\mihomo-manifest.json 及 service\mihomo-manifest.json)
+  let firstManifestReadError: MihomoSourceTrustResult | null = null;
   if (!options?.manifestPath) {
     const svcDir = getServiceInstallDir();
     const lockedManifestCandidates = [
@@ -390,7 +399,10 @@ export function verifyMihomoInstallSource(
     for (const lockedManifestPath of lockedManifestCandidates) {
       if (path.resolve(lockedManifestPath).toLowerCase() !== candidateManifest.toLowerCase()) {
         const serviceManifestRes = tryVerifyManifestFile(lockedManifestPath, false);
-        if (serviceManifestRes) return serviceManifestRes;
+        if (serviceManifestRes?.trusted) return serviceManifestRes;
+        if (serviceManifestRes && !serviceManifestRes.trusted && !firstManifestReadError) {
+          firstManifestReadError = serviceManifestRes;
+        }
       }
     }
   }
@@ -399,13 +411,17 @@ export function verifyMihomoInstallSource(
   const localManifestRes = tryVerifyManifestFile(candidateManifest, true);
   if (localManifestRes) return localManifestRes;
 
-  // 若两者均未命中但同目录本身处于不安全 ACL，仍保留明确错误提示
+  if (firstManifestReadError) {
+    return firstManifestReadError;
+  }
+
+  // 若两者均未命中但同目录本身处于不安全 ACL，明确指出未命中可信清单且源目录普通用户可写
   if (!fs.existsSync(candidateManifest)) {
     const binAcl = checkAclFn(resolvedBin);
     if (!binAcl.locked) {
       return {
         trusted: false,
-        error: `mihomo.exe 安装源或其父目录 ACL 不安全（普通用户可写，拒绝信任）: ${binAcl.unsafePath || resolvedBin} (${binAcl.reason || 'ACL unlocked'})`,
+        error: `mihomo.exe 未命中可信清单且安装源或其父目录 ACL 不安全（普通用户可写，拒绝信任）: ${binAcl.unsafePath || resolvedBin} (${binAcl.reason || 'ACL unlocked'})`,
       };
     }
   }
@@ -1597,12 +1613,12 @@ export class TunServiceManager {
         "    if ($appParentDir -and (Test-Path -LiteralPath $appParentDir)) {",
         "        $ownParentRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
         "        if ($ownParentRes.Code -ne 0) { throw ('icacls parent directory owner lock failed (code ' + $ownParentRes.Code + '): ' + $ownParentRes.Output) }",
-        "        $aclParentRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /Q')",
+        "        $aclParentRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(RX)\" /Q')",
         "        if ($aclParentRes.Code -ne 0) { throw ('icacls parent directory ACL lock failed (code ' + $aclParentRes.Code + '): ' + $aclParentRes.Output) }",
         "    }",
         "    $ownDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
         "    if ($ownDirRes.Code -ne 0) { throw ('icacls directory owner lock failed (code ' + $ownDirRes.Code + '): ' + $ownDirRes.Output) }",
-        "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /Q')",
+        "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" /grant:r \"*S-1-5-32-544:(OI)(CI)F\" /grant:r \"*S-1-5-32-545:(RX)\" /Q')",
         "    if ($aclDirRes.Code -ne 0) { throw ('icacls directory ACL lock failed (code ' + $aclDirRes.Code + '): ' + $aclDirRes.Output) }",
         "    Assert-NoReparseChain $runtimeDir",
         "    Assert-NoReparseChain $binDir",
@@ -1654,6 +1670,18 @@ export class TunServiceManager {
         "            Assert-SourceAclLocked $trustedManifest",
         "            Copy-Item -LiteralPath $trustedManifest -Destination $lockedManifestPath -Force",
         "        }",
+        "    }",
+        "    if (Test-Path -LiteralPath $persistentManifestPath) {",
+        "        $ownPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "        if ($ownPmRes.Code -ne 0) { throw ('icacls persistent manifest owner failed (code ' + $ownPmRes.Code + '): ' + $ownPmRes.Output) }",
+        "        $aclPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" /grant:r \"*S-1-5-32-544:(F)\" /grant:r \"*S-1-5-32-545:(R)\" /Q')",
+        "        if ($aclPmRes.Code -ne 0) { throw ('icacls persistent manifest ACL lock failed (code ' + $aclPmRes.Code + '): ' + $aclPmRes.Output) }",
+        "    }",
+        "    if (Test-Path -LiteralPath $lockedManifestPath) {",
+        "        $ownLmRes = Run-Native 'icacls.exe' ('\"' + $lockedManifestPath + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "        if ($ownLmRes.Code -ne 0) { throw ('icacls locked manifest owner failed (code ' + $ownLmRes.Code + '): ' + $ownLmRes.Output) }",
+        "        $aclLmRes = Run-Native 'icacls.exe' ('\"' + $lockedManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" /grant:r \"*S-1-5-32-544:(F)\" /grant:r \"*S-1-5-32-545:(R)\" /Q')",
+        "        if ($aclLmRes.Code -ne 0) { throw ('icacls locked manifest ACL lock failed (code ' + $aclLmRes.Code + '): ' + $aclLmRes.Output) }",
         "    }",
         "    if (Test-Path -LiteralPath $lockedBinPath) { Remove-Item -LiteralPath $lockedBinPath -Force -ErrorAction SilentlyContinue }",
         "    Copy-Item -LiteralPath $trustedBin -Destination $lockedBinPath -Force",
@@ -2142,11 +2170,11 @@ export class TunServiceManager {
         "    if (-not (Test-Path -LiteralPath $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }",
         "    $ownAppRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
         "    if ($ownAppRes.Code -ne 0) { throw ('icacls appParentDir owner lock failed: ' + $ownAppRes.Output) }",
-        "    $aclAppRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /Q')",
+        "    $aclAppRes = Run-Native 'icacls.exe' ('\"' + $appParentDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-545:(RX)\" /Q')",
         "    if ($aclAppRes.Code -ne 0) { throw ('icacls appParentDir lock failed: ' + $aclAppRes.Output) }",
         "    $ownDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /setowner \"*S-1-5-32-544\" /Q')",
         "    if ($ownDirRes.Code -ne 0) { throw ('icacls serviceDir owner lock failed: ' + $ownDirRes.Output) }",
-        "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /Q')",
+        "    $aclDirRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\" /inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-544:(OI)(CI)(F)\" /grant:r \"*S-1-5-32-545:(RX)\" /Q')",
         "    if ($aclDirRes.Code -ne 0) { throw ('icacls serviceDir lock failed: ' + $aclDirRes.Output) }",
         "    Assert-NoReparseChain $binDir",
         "    Assert-NoReparseChain $runtimeDir",
@@ -2171,7 +2199,7 @@ export class TunServiceManager {
         "    [System.IO.File]::WriteAllText($persistentManifestPath, $manifestJson, $utf8NoBom)",
         "    $ownPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /setowner \"*S-1-5-32-544\" /Q')",
         "    if ($ownPmRes.Code -ne 0) { throw ('icacls persistent manifest owner lock failed: ' + $ownPmRes.Output) }",
-        "    $aclPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /Q')",
+        "    $aclPmRes = Run-Native 'icacls.exe' ('\"' + $persistentManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" /grant:r \"*S-1-5-32-544:(F)\" /grant:r \"*S-1-5-32-545:(R)\" /Q')",
         "    if ($aclPmRes.Code -ne 0) { throw ('icacls persistent manifest lock failed: ' + $aclPmRes.Output) }",
         "    [System.IO.File]::WriteAllText($lockedManifestPath, $manifestJson, $utf8NoBom)",
         "    $qRes = Run-Native 'sc.exe' ('query ' + $serviceName)",
@@ -2201,6 +2229,12 @@ export class TunServiceManager {
         "        if ($ownSubRes.Code -ne 0) { throw ('icacls subitem owner lock failed: ' + $ownSubRes.Output) }",
         "        $aclSubRes = Run-Native 'icacls.exe' ('\"' + $serviceDir + '\\*\" /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" /T /Q')",
         "        if ($aclSubRes.Code -ne 0) { throw ('icacls subitem lock failed: ' + $aclSubRes.Output) }",
+        "    }",
+        "    if (Test-Path -LiteralPath $lockedManifestPath) {",
+        "        $ownLmRes = Run-Native 'icacls.exe' ('\"' + $lockedManifestPath + '\" /setowner \"*S-1-5-32-544\" /Q')",
+        "        if ($ownLmRes.Code -ne 0) { throw ('icacls locked manifest owner lock failed: ' + $ownLmRes.Output) }",
+        "        $aclLmRes = Run-Native 'icacls.exe' ('\"' + $lockedManifestPath + '\" /inheritance:r /grant:r \"*S-1-5-18:(F)\" /grant:r \"*S-1-5-32-544:(F)\" /grant:r \"*S-1-5-32-545:(R)\" /Q')",
+        "        if ($aclLmRes.Code -ne 0) { throw ('icacls locked manifest lock failed: ' + $aclLmRes.Output) }",
         "    }",
         "    if ($serviceRestarted) { Write-Result 'OK:RESTARTED' } else { Write-Result 'OK:SYNCED' }",
         "} catch {",
@@ -2274,3 +2308,95 @@ export class TunServiceManager {
 }
 
 export const tunServiceManager = new TunServiceManager();
+
+export interface TunServiceInstallController {
+  getMihomoExePath: () => string;
+  getBundledMihomoExePath: () => string;
+  setMihomoExePath: (exePath: string) => void;
+}
+
+export interface TunServiceInstallResult {
+  success: boolean;
+  error?: string;
+  usedBundledFallback?: boolean;
+  fallbackFromPath?: string;
+  warning?: string;
+}
+
+/**
+ * 将未登记到服务可信清单的遗留用户目录核心安全备份到 .bak，避免下次启动重新加载与服务版本不一致的核心
+ */
+export function backupUnverifiedMihomoBinary(exePath: string): boolean {
+  if (!exePath) return true;
+  try {
+    const resolved = path.resolve(exePath);
+    if (!fs.existsSync(resolved)) return true;
+    const backupPath = `${resolved}.bak`;
+    if (fs.existsSync(backupPath)) {
+      fs.unlinkSync(backupPath);
+    }
+    fs.renameSync(resolved, backupPath);
+    return true;
+  } catch (err: any) {
+    console.warn(`[TunService] 备份未入清单的用户目录内核失败 (${exePath}):`, err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * 共享服务安装入口：
+ * 1. 先以 verifyMihomoInstallSource 校验当前活跃核心，可信则直接安装；
+ * 2. 若当前为用户目录未入清单核心（如历史在线升级遗留/清单缺失），回退检验内置可信核心：
+ *    - 若内置核心通过验证，则使用内置核心安装并在成功后备份用户目录旧核心且对齐运行路径；
+ *    - 若内置核心亦未通过验证，严格 fail-closed 拒绝安装。
+ */
+export async function installTunServiceWithFallback(
+  isAlreadyAdmin: boolean,
+  controller: TunServiceInstallController,
+  installer: Pick<TunServiceManager, 'installService'> = tunServiceManager,
+  sourceOptions?: VerifyMihomoSourceOptions
+): Promise<TunServiceInstallResult> {
+  const currentExe = controller.getMihomoExePath();
+  const primaryTrust = verifyMihomoInstallSource(currentExe, sourceOptions);
+
+  if (primaryTrust.trusted) {
+    const installRes = await installer.installService(isAlreadyAdmin, currentExe, sourceOptions);
+    return {
+      ...installRes,
+      usedBundledFallback: false,
+    };
+  }
+
+  const bundledExe = controller.getBundledMihomoExePath();
+  const hasDistinctBundled =
+    Boolean(bundledExe) &&
+    path.resolve(bundledExe).toLowerCase() !== path.resolve(currentExe || '').toLowerCase();
+
+  if (hasDistinctBundled) {
+    const bundledTrust = verifyMihomoInstallSource(bundledExe, sourceOptions);
+    if (bundledTrust.trusted) {
+      console.warn(
+        `[TunService] 当前内核未通过服务信任校验 (${primaryTrust.error || 'untrusted'})，回退使用内置可信核心安装服务: ${bundledExe}`
+      );
+      const installRes = await installer.installService(isAlreadyAdmin, bundledExe, sourceOptions);
+      if (!installRes.success) {
+        return installRes;
+      }
+
+      backupUnverifiedMihomoBinary(currentExe);
+      controller.setMihomoExePath(bundledExe);
+      return {
+        ...installRes,
+        usedBundledFallback: true,
+        fallbackFromPath: currentExe,
+        warning:
+          '检测到用户目录内核未在服务可信清单中，已自动切换为内置可信内核完成服务安装并备份原核心文件；如需新版请在设置中重新在线更新内核。',
+      };
+    }
+  }
+
+  return {
+    success: false,
+    error: primaryTrust.error || '未找到通过可信验证的 mihomo.exe，拒绝安装特权服务',
+  };
+}

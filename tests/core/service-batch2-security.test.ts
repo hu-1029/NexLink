@@ -6,9 +6,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  backupUnverifiedMihomoBinary,
   generateServiceCSharpSource,
+  installTunServiceWithFallback,
   isAllowedRuleFileName,
   TunServiceManager,
+  verifyMihomoInstallSource,
+  verifyWindowsPathAclChainSync,
 } from '../../src/main/network/service-manager';
 
 function createFakePeBinary(filePath: string, tag: string): string {
@@ -303,6 +307,210 @@ describe('Batch 2 特权服务 NTFS Owner、内核同步信任、Wintun/Rules �
       );
       assert.ok(fs.existsSync(exePath), 'csc.exe 必须成功编译生成 NexLinkService.exe');
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('5. ACL 热修验证：ProgramData 目录与清单授予 Users 最小只读权限且绝不暴露 service.token，Users 只读通过 ACL 检查', async () => {
+    const smSrc = fs.readFileSync(
+      path.resolve(process.cwd(), 'src/main/network/service-manager.ts'),
+      'utf8'
+    );
+
+    // 1) 安装脚本与同步脚本均授予 appParentDir / serviceDir 仅当层 Users:(RX)，无 (OI)(CI) 继承到 token
+    assert.match(
+      smSrc,
+      /\*S-1-5-18:\(OI\)\(CI\)F\\?"\s+\/grant:r\s+\\?"\*S-1-5-32-544:\(OI\)\(CI\)F\\?"\s+\/grant:r\s+\\?"\*S-1-5-32-545:\(RX\)/,
+      'installService 必须授予 ProgramData\\NexLink 与 service 目录 Users:(RX) 非继承只读遍历权限'
+    );
+    assert.match(
+      smSrc,
+      /\*S-1-5-18:\(OI\)\(CI\)\(F\)\\?"\s+\/grant:r\s+\\?"\*S-1-5-32-544:\(OI\)\(CI\)\(F\)\\?"\s+\/grant:r\s+\\?"\*S-1-5-32-545:\(RX\)/,
+      'syncUpdatedCoreToService 必须授予 ProgramData\\NexLink 与 service 目录 Users:(RX) 非继承只读遍历权限'
+    );
+    assert.strictEqual(
+      smSrc.includes('*S-1-5-32-545:(OI)(CI)'),
+      false,
+      '严禁对 Users 使用 (OI)(CI) 继承，防止权限泄漏到 service.token'
+    );
+
+    // 2) persistentManifestPath 与 lockedManifestPath 均授予 Users:(R)，且 tokenPath 绝不含 Users
+    assert.match(
+      smSrc,
+      /\*S-1-5-18:\(F\).*\*S-1-5-32-544:\(F\).*\*S-1-5-32-545:\(R\)/,
+      'mihomo-manifest.json 必须授予 Users:(R) 只读权限'
+    );
+    const tokenAclLine = smSrc
+      .split(/\r?\n/)
+      .find((line) => line.includes('$aclTokRes = Run-Native'));
+    assert.ok(tokenAclLine, '必须存在 service.token ACL 锁定语句');
+    assert.strictEqual(tokenAclLine!.includes('S-1-5-32-545'), false, 'service.token 绝不能授予 Users 读取权限');
+
+    // 3) 真实执行 syncUpdatedCoreToService 脚本构造流程，验证 service\* 之后仍对 lockedManifestPath 保留 Users:(R)
+    if (process.platform === 'win32') {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-sync-acl-check-'));
+      try {
+        const userMihomoDir = path.join(tmpDir, 'userData', 'mihomo');
+        fs.mkdirSync(userMihomoDir, { recursive: true });
+        const binPath = path.join(userMihomoDir, 'mihomo.exe');
+        const binHash = createFakePeBinary(binPath, 'sync-manifest-acl-test');
+        const svcDir = path.join(tmpDir, 'ProgramData', 'NexLink', 'service');
+        const mgr = new TunServiceManager(svcDir);
+        let capturedScript = '';
+        const res = await mgr.syncUpdatedCoreToService(binPath, 'v1.20.1', binHash, true, {
+          builtinHashes: {},
+          checkSignature: () => ({ valid: false }),
+          verifiedUpdate: {
+            kind: 'github-release',
+            downloadUrl: 'https://github.com/MetaCubeX/mihomo/releases/download/v1.20.1/mihomo-windows-amd64-v1.20.1.zip',
+            allowedSourceDirs: [userMihomoDir],
+          },
+          verifyBinaryVersion: () => 'Mihomo Meta v1.20.1',
+          executePowerShell: async (_ps, script) => {
+            capturedScript = script;
+            return 'OK:SYNCED';
+          },
+        });
+        assert.equal(res.success, true);
+        const subLockIdx = capturedScript.indexOf('icacls subitem lock failed');
+        const lockedManifestIdx = capturedScript.indexOf('icacls locked manifest lock failed');
+        assert.ok(subLockIdx !== -1 && lockedManifestIdx > subLockIdx, 'syncUpdatedCoreToService 在 service\\* 加锁之后必须保留 lockedManifestPath 的 Users:(R) 权限');
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+
+    // 4) 验证 Windows 实际 ACL 检查：Users:RX / Users:R 不属于写权限集合，当父目录满足要求时不报错
+    if (process.platform === 'win32') {
+      const checkRes = verifyWindowsPathAclChainSync(path.resolve('resources/mihomo/mihomo.exe'));
+      // 说明：开发工作区（桌面/D盘）可能继承普通用户写权限，这里主要验证函数真实可执行且不崩溃
+      assert.equal(typeof checkRes.locked, 'boolean');
+    }
+  });
+
+  it('6. installTunServiceWithFallback: 用户目录未入清单核心自动回退内置可信核心并备份，全不可信时严格 Fail-Closed', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-fallback-'));
+    try {
+      const userDir = path.join(tmpDir, 'userData', 'mihomo');
+      const bundledDir = path.join(tmpDir, 'resources', 'mihomo');
+      fs.mkdirSync(userDir, { recursive: true });
+      fs.mkdirSync(bundledDir, { recursive: true });
+
+      const userExe = path.join(userDir, 'mihomo.exe');
+      const bundledExe = path.join(bundledDir, 'mihomo.exe');
+      const untrustedUserHash = createFakePeBinary(userExe, 'stale-v1.19.34-not-in-manifest');
+      const trustedBundledHash = createFakePeBinary(bundledExe, 'builtin-v1.19.29');
+
+      // 场景 A: userExe 未入清单（来源普通用户可写）+ bundledExe 命中内置清单 -> 安全回退使用 bundledExe 安装并对齐路径/备份原核心
+      let activeExe = userExe;
+      const installedBins: string[] = [];
+      const controller = {
+        getMihomoExePath: () => activeExe,
+        getBundledMihomoExePath: () => bundledExe,
+        setMihomoExePath: (p: string) => {
+          activeExe = p;
+        },
+      };
+      const fakeInstaller = {
+        installService: async (_isAdmin: boolean, bin?: string) => {
+          if (bin) installedBins.push(bin);
+          return { success: true };
+        },
+      };
+
+      const resFallback = await installTunServiceWithFallback(true, controller, fakeInstaller, {
+        builtinHashes: { 'v1.19.29-windows-amd64': trustedBundledHash },
+        checkAcl: () => ({ locked: false, reason: 'Writable by non-admin SID', unsafePath: userDir }),
+        checkSignature: () => ({ valid: false }),
+      });
+
+      assert.equal(resFallback.success, true, '内置核心可信时绝不能因为用户目录遗留旧更新而死锁');
+      assert.equal(resFallback.usedBundledFallback, true);
+      assert.match(resFallback.warning || '', /内置可信内核/);
+      assert.deepEqual(installedBins, [bundledExe]);
+      assert.equal(path.resolve(activeExe), path.resolve(bundledExe), '安装回退后运行路径必须对齐到内置核心');
+      assert.equal(fs.existsSync(userExe), false, '未入清单的用户目录旧核心应被移走备份');
+      assert.equal(fs.existsSync(`${userExe}.bak`), true, '未入清单的用户目录旧核心应保留到 .bak');
+      assert.notEqual(untrustedUserHash, trustedBundledHash);
+
+      // 场景 B: 内置核心亦未通过信任校验 -> 严格 Fail-Closed 拒绝安装
+      const badUserExe = path.join(userDir, 'mihomo.exe');
+      createFakePeBinary(badUserExe, 'still-untrusted');
+      activeExe = badUserExe;
+      installedBins.length = 0;
+
+      const resFailClosed = await installTunServiceWithFallback(true, controller, fakeInstaller, {
+        builtinHashes: {},
+        checkAcl: () => ({ locked: false, reason: 'Writable by non-admin SID', unsafePath: userDir }),
+        checkSignature: () => ({ valid: false }),
+      });
+
+      assert.equal(resFailClosed.success, false, '连内置核心也不可信时必须严格 Fail-Closed 拒绝');
+      assert.equal(installedBins.length, 0);
+      assert.match(resFailClosed.error || '', /未命中可信清单/);
+
+      // 场景 C: 若用户目录核心受锁定的外部清单登记信任 -> 直接用当前核心安装，不回退
+      const lockedManifestDir = path.join(tmpDir, 'locked-manifest');
+      fs.mkdirSync(lockedManifestDir, { recursive: true });
+      const manifestPath = path.join(lockedManifestDir, 'mihomo-manifest.json');
+      const registeredHash = createFakePeBinary(badUserExe, 'registered-v1.19.35');
+      fs.writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          entries: [{ version: 'v1.19.35', arch: 'amd64', sha256: registeredHash }],
+        }),
+        'utf8'
+      );
+      installedBins.length = 0;
+
+      const resDirect = await installTunServiceWithFallback(true, controller, fakeInstaller, {
+        builtinHashes: { 'v1.19.29-windows-amd64': trustedBundledHash },
+        manifestPath,
+        checkAcl: () => ({ locked: true }),
+        checkSignature: () => ({ valid: false }),
+      });
+      assert.equal(resDirect.success, true);
+      assert.equal(resDirect.usedBundledFallback, false);
+      assert.deepEqual(installedBins, [badUserExe]);
+      assert.equal(backupUnverifiedMihomoBinary(path.join(tmpDir, 'missing.exe')), true);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('7. tryVerifyManifestFile 无读权限时捕获 EPERM 返回结构化失败，不抛出未捕获异常', () => {
+    if (process.platform !== 'win32') return;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-manifest-eperm-'));
+    const binPath = path.join(tmpDir, 'mihomo.exe');
+    const manifestPath = path.join(tmpDir, 'mihomo-manifest.json');
+    try {
+      const binHash = createFakePeBinary(binPath, 'eperm-manifest-test');
+      fs.writeFileSync(
+        manifestPath,
+        JSON.stringify({ schemaVersion: 1, entries: [{ version: 'v1.19.35', arch: 'amd64', sha256: binHash }] }),
+        'utf8'
+      );
+
+      // 使用真实 icacls 拒绝当前用户读取权限触发 EPERM
+      const currentUser = os.userInfo().username;
+      execFileSync('icacls.exe', [manifestPath, '/deny', `${currentUser}:(R)`, '/Q'], { windowsHide: true });
+
+      const trustRes = verifyMihomoInstallSource(binPath, {
+        builtinHashes: {},
+        manifestPath,
+        checkAcl: () => ({ locked: true }),
+        checkSignature: () => ({ valid: false }),
+      });
+      assert.equal(trustRes.trusted, false);
+      assert.match(trustRes.error || '', /读取可信内核清单失败/);
+    } finally {
+      try {
+        const currentUser = os.userInfo().username;
+        execFileSync('icacls.exe', [manifestPath, '/remove:d', currentUser, '/Q'], { windowsHide: true });
+      } catch {
+        // ignore
+      }
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

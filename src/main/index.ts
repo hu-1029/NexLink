@@ -9,7 +9,11 @@ import { storageManager } from './storage/store';
 import { subscriptionManager } from './subscription/manager';
 import { systemProxyManager } from './network/system-proxy';
 import { checkTunPrerequisites, cleanupLegacyRunAsAdminRegistry, isCurrentProcessAdmin } from './network/tun-checker';
-import { tunServiceManager } from './network/service-manager';
+import {
+  backupUnverifiedMihomoBinary,
+  installTunServiceWithFallback,
+  tunServiceManager,
+} from './network/service-manager';
 import { updateService } from './services/updater';
 
 const app = Electron.app;
@@ -170,6 +174,7 @@ export function updateTrayContextMenu(): void {
       type: 'checkbox',
       checked: Boolean(settings.tunMode),
       click: async (item) => {
+        let pendingFallbackBackupPath: string | undefined;
         if (item.checked) {
           const prereq = await checkTunPrerequisites();
           if (!prereq.canEnableTun) {
@@ -187,14 +192,19 @@ export function updateTrayContextMenu(): void {
               updateTrayState();
               return;
             }
-            const installRes = await tunServiceManager.installService(
+            const installRes = await installTunServiceWithFallback(
               isCurrentProcessAdmin(),
-              mihomoManager.getMihomoExePath()
+              mihomoManager,
+              tunServiceManager
             );
             if (!installRes.success) {
               dialog.showErrorBox('服务安装失败', installRes.error || '请稍后重试');
               updateTrayState();
               return;
+            }
+            if (installRes.usedBundledFallback && installRes.warning) {
+              console.warn('[Tray] 服务安装已安全回退至内置内核:', installRes.warning);
+              pendingFallbackBackupPath = installRes.fallbackFromPath;
             }
           }
           const drv = await mihomoManager.ensureWintunReady();
@@ -217,6 +227,9 @@ export function updateTrayContextMenu(): void {
             settings: storageManager.getSettings(),
             selectedNodeName,
           });
+          if (pendingFallbackBackupPath) {
+            backupUnverifiedMihomoBinary(pendingFallbackBackupPath);
+          }
         }
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send(IPC_CHANNELS.DATA_SYNC, storageManager.getData());

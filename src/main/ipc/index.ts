@@ -10,7 +10,11 @@ import type {
 import { mihomoManager } from '../core/mihomo-process';
 import { systemProxyManager } from '../network/system-proxy';
 import { checkTunPrerequisites, isCurrentProcessAdmin, restartAsAdmin } from '../network/tun-checker';
-import { tunServiceManager } from '../network/service-manager';
+import {
+  backupUnverifiedMihomoBinary,
+  installTunServiceWithFallback,
+  tunServiceManager,
+} from '../network/service-manager';
 import { storageManager, type AppPersistedState } from '../storage/store';
 import { subscriptionManager } from '../subscription/manager';
 import { resolveSafeLocalProfilePath } from '../subscription/fetcher';
@@ -699,7 +703,11 @@ export function registerIpcHandlers(
   });
 
   ipcMain.handle(IPC_CHANNELS.SYS_TUN_SERVICE_INSTALL, async () => {
-    const res = await tunServiceManager.installService(isCurrentProcessAdmin(), mihomoManager.getMihomoExePath());
+    const res = await installTunServiceWithFallback(
+      isCurrentProcessAdmin(),
+      mihomoManager,
+      tunServiceManager
+    );
     if (res.success && mihomoManager.getStatus().running) {
       // 服务安装完成后若核心正在运行，平滑迁移到服务模式，使后续开关 TUN 零重启秒开
       const nodes = storageManager.getNodes();
@@ -712,6 +720,9 @@ export function registerIpcHandlers(
         settings: storageManager.getSettings(),
         selectedNodeName,
       });
+      if (res.usedBundledFallback && res.fallbackFromPath) {
+        backupUnverifiedMihomoBinary(res.fallbackFromPath);
+      }
     }
     return res;
   });
