@@ -77,7 +77,7 @@ describe('TUN 服务模式 (对标 Clash Verge Service Mode) 与 P0 安全边界
   it('2. 验证服务端忽略客户端传入的恶意 binPath/configDir/configPath，仅使用 configContent，并拦截超大 HTTP 请求体 (413)', async () => {
     const tmpDir = path.join(os.tmpdir(), `nexlink-svc-test-${Date.now()}`);
     fs.mkdirSync(tmpDir, { recursive: true });
-    const token = 'test-secret-token-123456';
+    const token = '0123456789abcdef'.repeat(4);
     fs.writeFileSync(path.join(tmpDir, 'service.token'), token, 'utf8');
 
     const MAX_BODY_BYTES = 5 * 1024 * 1024;

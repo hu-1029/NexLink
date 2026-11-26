@@ -161,8 +161,8 @@ describe('Batch 2 特权服务 NTFS Owner、内核同步信任、Wintun/Rules �
       assert.ok(capturedPsScript.includes(newSha), '提权脚本必须包含新内核 SHA-256');
       assert.ok(capturedPsScript.includes('mihomo-manifest.json'), '提权脚本必须写入锁定清单');
 
-      // 2) 正向用例：回退流程 (rollback) 位于受控目录且通过 -v 校验时应放行
-      const okRollbackRes = await mgr.syncUpdatedCoreToService(
+      // 2) 安全拦截：已移除 kind: 'rollback' 绕过通道，伪造 rollback provenance 同步未签名/未入清单内核必须被拒绝
+      const rejectedRollbackRes = await mgr.syncUpdatedCoreToService(
         newExe,
         'v1.20.0',
         newSha,
@@ -172,15 +172,15 @@ describe('Batch 2 特权服务 NTFS Owner、内核同步信任、Wintun/Rules �
           checkAcl: () => ({ locked: false, reason: 'User-writable userData dir', unsafePath: newExe }),
           checkSignature: () => ({ valid: false, reason: 'NotSigned' }),
           verifiedUpdate: {
-            kind: 'rollback',
+            kind: 'rollback' as unknown as 'github-release',
             allowedSourceDirs: [userMihomoDir],
           },
           verifyBinaryVersion: () => 'Mihomo Meta v1.20.0 windows amd64',
           executePowerShell: async () => 'OK:RESTARTED',
         }
       );
-      assert.equal(okRollbackRes.success, true);
-      assert.equal(okRollbackRes.serviceRestarted, true);
+      assert.equal(rejectedRollbackRes.success, false, 'Patch A1: 必须拒绝 rollback provenance 绕过清单/签名校验');
+      assert.match(rejectedRollbackRes.error || '', /无效的更新来源类型|拒绝同步/);
 
       // 3) 越权拦截：即使伪造 verifiedUpdate，路径不在 allowedSourceDirs 内 -> 必须拦截
       const resOutsideDir = await mgr.syncUpdatedCoreToService(

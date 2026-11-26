@@ -468,18 +468,21 @@ export class CoreUpdaterService {
         `$destDir = [System.IO.Path]::GetFullPath('${escapedExtract}')`,
         "$destPrefix = if ($destDir.EndsWith('\\')) { $destDir } else { $destDir + '\\' }",
         "$maxUncompressed = 200 * 1024 * 1024",
+        "$maxEntries = 100",
+        "$entryCount = 0",
         "$totalUncompressed = 0L",
+        "$buffer = New-Object byte[] 65536",
         "$zip = [System.IO.Compression.ZipFile]::OpenRead($zipPath)",
         "try {",
         "    foreach ($entry in $zip.Entries) {",
+        "        $entryCount++",
+        "        if ($entryCount -gt $maxEntries) { throw 'Zip archive exceeds entry count safety limit' }",
         "        $name = $entry.FullName",
         "        if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith('/') -or $name.StartsWith('\\') -or ($name -match '^[a-zA-Z]:')) {",
         "            throw ('Zip Slip unsafe entry path rejected: ' + $name)",
         "        }",
         "        $segs = $name.Split(@('/', '\\'), [System.StringSplitOptions]::RemoveEmptyEntries)",
         "        if ($segs -contains '..') { throw ('Zip Slip traversal rejected: ' + $name) }",
-        "        $totalUncompressed += [long]$entry.Length",
-        "        if ($totalUncompressed -gt $maxUncompressed) { throw 'Zip archive exceeds uncompressed size safety limit' }",
         "        $targetPath = [System.IO.Path]::GetFullPath((Join-Path $destDir $name))",
         "        if (-not $targetPath.StartsWith($destPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {",
         "            throw ('Zip Slip escaped destination dir: ' + $name)",
@@ -489,7 +492,20 @@ export class CoreUpdaterService {
         "        } else {",
         "            $parentDir = [System.IO.Path]::GetDirectoryName($targetPath)",
         "            if ($parentDir) { [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null }",
-        "            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $targetPath, $true)",
+        "            $inStream = $entry.Open()",
+        "            $outStream = [System.IO.File]::Create($targetPath)",
+        "            try {",
+        "                while (($read = $inStream.Read($buffer, 0, $buffer.Length)) -gt 0) {",
+        "                    $totalUncompressed += $read",
+        "                    if ($totalUncompressed -gt $maxUncompressed) {",
+        "                        throw 'Zip archive exceeds uncompressed size safety limit'",
+        "                    }",
+        "                    $outStream.Write($buffer, 0, $read)",
+        "                }",
+        "            } finally {",
+        "                $outStream.Dispose()",
+        "                $inStream.Dispose()",
+        "            }",
         "        }",
         "    }",
         "} finally {",
@@ -692,6 +708,18 @@ export class CoreUpdaterService {
         };
       }
 
+      if (hasBackup) {
+        const backupTrust = verifyMihomoInstallSource(backupExe);
+        if (!backupTrust.trusted) {
+          return {
+            success: false,
+            updated: false,
+            currentVersion: mihomoManager.getInstalledCoreVersion() || 'unknown',
+            message: `安全拦截: 备份内核未通过可信来源校验，已拒绝回退并保留现状 (${backupTrust.error || 'untrusted backup'})`,
+          };
+        }
+      }
+
       const wasRunning = mihomoManager.getStatus().running;
       if (wasRunning) {
         await mihomoManager.stop();
@@ -723,13 +751,7 @@ export class CoreUpdaterService {
           restoredPath,
           restoredVer,
           restoredSha256,
-          isCurrentProcessAdmin(),
-          {
-            verifiedUpdate: {
-              kind: 'rollback',
-              allowedSourceDirs: [userMihomoDir, path.dirname(bundledExe)].filter(Boolean),
-            },
-          }
+          isCurrentProcessAdmin()
         );
         serviceSynced = syncRes.success;
         syncError = syncRes.error;
@@ -775,10 +797,12 @@ export class CoreUpdaterService {
   /**
    * 更新 GeoIP / GeoSite 规则库：核心运行时优先走 Mihomo 热更新 API（免重启）；未运行时直接拉取 geoip.metadb
    */
-  public async updateGeoDatabases(): Promise<{ success: boolean; message: string }> {
+  public async updateGeoDatabases(options?: {
+    fetchBuffer?: (url: string) => Promise<Buffer>;
+  }): Promise<{ success: boolean; message: string }> {
     try {
       const status = mihomoManager.getStatus();
-      if (status.running) {
+      if (status.running && !options?.fetchBuffer) {
         const apiRes = await mihomoManager.getApiClient().updateGeoDatabases();
         if (apiRes.ok) {
           return {
@@ -795,12 +819,34 @@ export class CoreUpdaterService {
         throw new Error('运行时目录未初始化');
       }
       const geoUrl = 'https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.metadb';
-      const buf = await fetchBufferSmart(geoUrl, {}, 45000);
+      const buf = options?.fetchBuffer
+        ? await options.fetchBuffer(geoUrl)
+        : await fetchBufferSmart(geoUrl, {}, 45000, undefined, 64 * 1024 * 1024);
       if (buf.length < 100 * 1024) {
         throw new Error('下载的 geoip.metadb 文件大小异常，已放弃覆盖');
       }
+      const mmdbMarker = Buffer.from('\xab\xcd\xefMaxMind.com', 'latin1');
+      if (buf.lastIndexOf(mmdbMarker) < 0) {
+        throw new Error('下载的 geoip.metadb 格式校验失败（缺少 MaxMind 元数据标记）');
+      }
       fs.mkdirSync(runtimeDir, { recursive: true });
-      fs.writeFileSync(path.join(runtimeDir, 'geoip.metadb'), buf);
+      const geoPath = path.join(runtimeDir, 'geoip.metadb');
+      if (fs.existsSync(geoPath) && fs.lstatSync(geoPath).isSymbolicLink()) {
+        throw new Error('geoip.metadb 目标路径为符号链接，已拒绝覆盖');
+      }
+      const tmpGeoPath = path.join(runtimeDir, `geoip.metadb.tmp.${process.pid}.${Date.now()}`);
+      try {
+        fs.writeFileSync(tmpGeoPath, buf);
+        fs.renameSync(tmpGeoPath, geoPath);
+      } finally {
+        if (fs.existsSync(tmpGeoPath)) {
+          try {
+            fs.unlinkSync(tmpGeoPath);
+          } catch {
+            // ignore cleanup failure
+          }
+        }
+      }
       return {
         success: true,
         message: `GeoIP 规则库已更新至最新版 (${(buf.length / (1024 * 1024)).toFixed(1)} MB)`,

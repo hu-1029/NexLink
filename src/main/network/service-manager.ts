@@ -135,7 +135,7 @@ export interface VerifyMihomoSourceOptions {
 }
 
 export interface VerifiedCoreUpdateProvenance {
-  kind: 'github-release' | 'rollback';
+  kind: 'github-release';
   downloadUrl?: string;
   allowedSourceDirs: string[];
 }
@@ -808,10 +808,14 @@ namespace NexLinkServiceHost
         private void LoadToken()
         {
             string tokenPath = Path.Combine(_serviceDir, "service.token");
-            if (File.Exists(tokenPath))
+            if (!File.Exists(tokenPath)) return;
+            VerifyFileAclLocked(tokenPath);
+            string tok = File.ReadAllText(tokenPath, Encoding.UTF8).Trim().TrimStart('\\uFEFF');
+            if (!System.Text.RegularExpressions.Regex.IsMatch(tok, "^[a-fA-F0-9]{64}$"))
             {
-                _authToken = File.ReadAllText(tokenPath, Encoding.UTF8).Trim().TrimStart('\\uFEFF');
+                throw new InvalidDataException("Invalid service.token format");
             }
+            _authToken = tok;
         }
 
         private void ListenLoop()
@@ -1333,13 +1337,16 @@ export class TunServiceManager {
 
   private readToken(): string {
     try {
-      if (fs.existsSync(this.tokenPath)) {
-        return fs.readFileSync(this.tokenPath, 'utf8').replace(/^\uFEFF/, '').trim();
+      if (!fs.existsSync(this.tokenPath)) return '';
+      const st = fs.lstatSync(this.tokenPath);
+      if (!st.isFile() || st.isSymbolicLink() || st.size > 256) {
+        return '';
       }
+      const raw = fs.readFileSync(this.tokenPath, 'utf8').replace(/^\uFEFF/, '').trim();
+      return /^[a-f0-9]{64}$/i.test(raw) ? raw : '';
     } catch {
-      // ignore
+      return '';
     }
-    return '';
   }
 
   private async request<T = any>(
@@ -2069,7 +2076,7 @@ export class TunServiceManager {
             error: '安全拦截: 更新来源 URL 非官方 MetaCubeX/mihomo Release 地址，拒绝同步',
           };
         }
-      } else if (verifiedUpdate.kind !== 'rollback') {
+      } else {
         return { success: false, error: '无效的更新来源类型，拒绝同步' };
       }
 

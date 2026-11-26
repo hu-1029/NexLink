@@ -228,4 +228,85 @@ describe('Mihomo 内核更新与服务指纹同步测试', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('6. updateGeoDatabases 必须校验 MaxMind.com 魔数并原子替换且不残留 .tmp 文件', async () => {
+    const { mihomoManager } = await import('../../src/main/core/mihomo-process');
+    const tmpRuntimeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-geoip-test-'));
+    const origGetRuntimeDir = mihomoManager.getRuntimeDir.bind(mihomoManager);
+    const origGetStatus = mihomoManager.getStatus.bind(mihomoManager);
+    (mihomoManager as any).getRuntimeDir = () => tmpRuntimeDir;
+    (mihomoManager as any).getStatus = () => ({ running: false });
+
+    try {
+      const geoPath = path.join(tmpRuntimeDir, 'geoip.metadb');
+      const originalData = Buffer.from('original-valid-geoip-content');
+      fs.writeFileSync(geoPath, originalData);
+
+      const coreUpdater = new CoreUpdaterService();
+
+      // 1) 无 MaxMind.com 元数据标记的大文件 -> 必须拒绝覆盖且无 .tmp 残留
+      const badBuf = Buffer.alloc(128 * 1024, 0x41);
+      const badRes = await coreUpdater.updateGeoDatabases({
+        fetchBuffer: async () => badBuf,
+      });
+      assert.equal(badRes.success, false);
+      assert.match(badRes.message, /MaxMind/);
+      assert.deepEqual(fs.readFileSync(geoPath), originalData, '校验失败时绝不能覆盖原有 geoip.metadb');
+      assert.equal(
+        fs.readdirSync(tmpRuntimeDir).some((f) => f.includes('.tmp.')),
+        false,
+        '校验失败时不应残留 .tmp 文件'
+      );
+
+      // 2) 含 \xab\xcd\xefMaxMind.com 魔数的合法文件 -> 原子替换成功且无 .tmp 残留
+      const validBuf = Buffer.alloc(128 * 1024, 0x00);
+      Buffer.from('\xab\xcd\xefMaxMind.com', 'latin1').copy(validBuf, validBuf.length - 32);
+      const okRes = await coreUpdater.updateGeoDatabases({
+        fetchBuffer: async () => validBuf,
+      });
+      assert.equal(okRes.success, true);
+      assert.deepEqual(fs.readFileSync(geoPath), validBuf);
+      assert.equal(
+        fs.readdirSync(tmpRuntimeDir).some((f) => f.includes('.tmp.')),
+        false,
+        '原子替换完成后不应残留 .tmp 文件'
+      );
+    } finally {
+      (mihomoManager as any).getRuntimeDir = origGetRuntimeDir;
+      (mihomoManager as any).getStatus = origGetStatus;
+      fs.rmSync(tmpRuntimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it('7. rollbackCore 在覆盖 userExe 和删除 .bak 前先校验 backupExe 来源，不可信时拒绝回退并保留现状', async () => {
+    const { mihomoManager } = await import('../../src/main/core/mihomo-process');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-rollback-precheck-'));
+    const origGetUserMihomoDir = mihomoManager.getUserMihomoDir.bind(mihomoManager);
+    const origGetStatus = mihomoManager.getStatus.bind(mihomoManager);
+    (mihomoManager as any).getUserMihomoDir = () => tmpDir;
+    (mihomoManager as any).getStatus = () => ({ running: false });
+
+    try {
+      const userExe = path.join(tmpDir, 'mihomo.exe');
+      const backupExe = path.join(tmpDir, 'mihomo.exe.bak');
+      const currentBytes = Buffer.alloc(1024 * 1024 + 32, 0x42);
+      const untrustedBackupBytes = Buffer.alloc(1024 * 1024 + 32, 0x43);
+      fs.writeFileSync(userExe, currentBytes);
+      fs.writeFileSync(backupExe, untrustedBackupBytes);
+
+      const coreUpdater = new CoreUpdaterService();
+      const res = await coreUpdater.rollbackCore();
+
+      assert.equal(res.success, false, '不可信 .bak 必须被前置校验拒绝');
+      assert.equal(res.updated, false);
+      assert.match(res.message, /安全拦截|可信来源校验/);
+      assert.deepEqual(fs.readFileSync(userExe), currentBytes, '拒绝回退时绝不能覆盖现有 mihomo.exe');
+      assert.equal(fs.existsSync(backupExe), true, '拒绝回退时绝不能删除 mihomo.exe.bak');
+      assert.deepEqual(fs.readFileSync(backupExe), untrustedBackupBytes);
+    } finally {
+      (mihomoManager as any).getUserMihomoDir = origGetUserMihomoDir;
+      (mihomoManager as any).getStatus = origGetStatus;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
