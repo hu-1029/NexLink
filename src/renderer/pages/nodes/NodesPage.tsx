@@ -731,7 +731,7 @@ export const NodesPage: React.FC = () => {
           <Server className="w-12 h-12 text-slate-300 mb-3" />
           <h3 className="text-sm font-bold text-slate-700 dark:text-slate-200">未找到有效代理节点</h3>
           <p className="text-xs text-slate-400 mt-1 max-w-sm leading-relaxed">
-            当前暂无可用节点，请在「订阅管理」中刷新订阅源，或前往「智能导入中心」一键粘贴导入节点。
+            当前暂无可用节点，请前往「订阅管理」刷新订阅源或一键粘贴导入节点。
           </p>
         </div>
       ) : (
