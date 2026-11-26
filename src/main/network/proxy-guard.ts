@@ -134,7 +134,7 @@ function Test-ProxyServerMatchesPort([string]$serverStr, [int]$portNum) {
     foreach ($entry in ($serverStr -split ';')) {
         $item = $entry.Trim()
         if (-not $item) { continue }
-        $addr = ($item -replace '^[a-zA-Z0-9.+-]+=', '').Trim().ToLowerInvariant()
+        $addr = ($item -replace '^[a-zA-Z0-9.+-]+=', '' -replace '^[a-zA-Z0-9.+-]+://', '').Trim().ToLowerInvariant()
         if ($addr -match '^(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):(\\d+)$') {
             if ([int]$Matches[1] -eq $portNum) { return $true }
         }
@@ -148,9 +148,9 @@ if ($mihomoPid -gt 0) {
 }
 
 if ($parentPid -gt 0) {
-    $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
-    if ($parent) {
-        $parent.WaitForExit()
+    $parentInit = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if ($parentInit) {
+        $parentInit.WaitForExit()
     }
     # 父进程（NexLink）退出后，等待 300 毫秒避免与正常退出时的常规恢复发生写冲突
     Start-Sleep -Milliseconds 300

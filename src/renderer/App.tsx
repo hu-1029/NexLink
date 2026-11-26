@@ -194,7 +194,14 @@ export const App: React.FC = () => {
   }, [currentTab]);
 
   const handleSetTheme = (newTheme: ThemeMode) => {
-    const isDark = resolveIsDark(newTheme, systemDark);
+    const latestSystemDark =
+      newTheme === 'system' && typeof window.matchMedia === 'function'
+        ? window.matchMedia('(prefers-color-scheme: dark)').matches
+        : systemDark;
+    if (latestSystemDark !== systemDark) {
+      setSystemDark(latestSystemDark);
+    }
+    const isDark = resolveIsDark(newTheme, latestSystemDark);
     const defaults = getDefaultColorsForTheme(isDark ? 'dark' : 'light');
     setTheme(newTheme);
     document.documentElement.classList.toggle('dark', isDark);
@@ -226,8 +233,6 @@ export const App: React.FC = () => {
         setSystemDark(currentDark);
       }
       applyThemeToDocument('system', currentDark);
-      const defaults = getDefaultColorsForTheme(currentDark ? 'dark' : 'light');
-      applyThemeColors(defaults.bg, defaults.fg);
 
       const listener = (e: MediaQueryListEvent) => {
         setSystemDark(e.matches);

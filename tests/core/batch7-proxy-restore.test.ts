@@ -255,11 +255,16 @@ Write-Output 'AST_OK'
     assert.ok(script.includes('$coreProc.StartTime -eq $coreInit.StartTime'));
     assert.ok(script.includes('$expectedMihomoPath'));
     assert.ok(script.includes('$coreProc.Path'));
+    assert.ok(script.includes('$parentInit.WaitForExit()'));
+    assert.strictEqual(script.includes('if (-not $parentInit)'), false, '冷启动期间父进程退出也不得提前 exit 0');
   });
 
   it('6. Patch C: build/installer.nsh 卸载清代理脚本具备 C:\\ProgramData 回退、TCP 端口探测且经 AST 解析 0 语法错误', () => {
     const nsh = fs.readFileSync(path.resolve('build/installer.nsh'), 'utf8');
     assert.ok(nsh.includes('StrCpy $4 "C:\\ProgramData"'), 'ProgramData 为空时必须回退到 C:\\ProgramData');
+    const svcDeleteIdx = nsh.indexOf('sc.exe delete NexLinkCoreService');
+    const tcpCleanIdx = nsh.indexOf('System.Net.Sockets.TcpClient');
+    assert.ok(svcDeleteIdx > 0 && tcpCleanIdx > svcDeleteIdx, '卸载清代理必须在停删 NexLinkCoreService 之后执行');
 
     const proxyCleanLine = nsh
       .split(/\r?\n/)
