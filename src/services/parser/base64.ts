@@ -3,10 +3,27 @@
  * 支持 URL-Safe Base64、补齐缺失的等号、UTF-8 多字节字符与 Base64 订阅特征自动嗅探
  */
 
+const MAX_BASE64_SNIFF_DEPTH = 5;
+
+function isPrintableUtf8Text(text: string): boolean {
+  if (!text || text.includes('\uFFFD')) return false;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+      return false;
+    }
+    if (code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
- * 判断字符串是否大概率为 Base64 编码的订阅内容
+ * 判断字符串是否大概率为 Base64 编码的订阅内容（支持多层嵌套 Base64 递归探测）
  */
-export function isLikelyBase64(str: string): boolean {
+export function isLikelyBase64(str: string, depth: number = 0): boolean {
+  if (depth >= MAX_BASE64_SNIFF_DEPTH) return false;
   const trimmed = str.trim();
   if (trimmed.length < 16) return false;
 
@@ -19,6 +36,8 @@ export function isLikelyBase64(str: string): boolean {
     trimmed.startsWith('hysteria2://') ||
     trimmed.startsWith('hy2://') ||
     trimmed.startsWith('tuic://') ||
+    trimmed.startsWith('wireguard://') ||
+    trimmed.startsWith('wg://') ||
     trimmed.startsWith('proxies:') ||
     trimmed.startsWith('{') ||
     trimmed.startsWith('---')
@@ -34,15 +53,24 @@ export function isLikelyBase64(str: string): boolean {
     return false;
   }
 
-  // 尝试试探性解码，必须包含明确协议/配置特征
+  // 尝试试探性解码：须为合法可打印 UTF-8 文本，且包含明确协议/配置特征或为合法的嵌套 Base64 中间态
   try {
     const decoded = safeBase64Decode(cleanStr);
-    return (
+    if (!isPrintableUtf8Text(decoded)) {
+      return false;
+    }
+    if (
       decoded.includes('://') ||
       decoded.includes('proxies:') ||
       decoded.includes('Proxy:') ||
       decoded.includes('"outbounds"')
-    );
+    ) {
+      return true;
+    }
+    if (decoded.trim() === trimmed) {
+      return false;
+    }
+    return isLikelyBase64(decoded, depth + 1);
   } catch {
     return false;
   }

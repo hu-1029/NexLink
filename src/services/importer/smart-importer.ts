@@ -34,9 +34,10 @@ export function smartParse(
     };
   }
 
-  // 1. 递归检测并解码 Base64 订阅包（限制递归深度防栈溢出）
+  // 1. 递归检测并解码 Base64 订阅包（限制递归深度防死循环与栈溢出）
+  const MAX_BASE64_DEPTH = 5;
   const depth = (options as any)._depth || 0;
-  if (depth < 3 && isLikelyBase64(trimmed)) {
+  if (depth < MAX_BASE64_DEPTH && isLikelyBase64(trimmed)) {
     try {
       const decoded = safeBase64Decode(trimmed);
       if (decoded && decoded.trim() !== trimmed) {

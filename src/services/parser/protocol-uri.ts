@@ -37,6 +37,60 @@ interface ParsedUriParts {
   params: URLSearchParams;
 }
 
+function parseHostAndPort(
+  rawHostPort: string,
+  defaultPort?: number
+): { server: string; port: number } {
+  const hostPort = rawHostPort.trim();
+  let server = '';
+  let port = defaultPort ?? 0;
+
+  if (hostPort.startsWith('[')) {
+    const closeBracket = hostPort.indexOf(']');
+    if (closeBracket === -1) {
+      throw new Error(`IPv6 地址缺少闭合括号 ]: "${hostPort}"`);
+    }
+    server = hostPort.slice(1, closeBracket).trim();
+    const rest = hostPort.slice(closeBracket + 1).trim();
+    if (!rest) {
+      if (defaultPort === undefined) {
+        throw new Error(`链接缺少端口号: "${hostPort}"`);
+      }
+      port = defaultPort;
+    } else if (rest.startsWith(':')) {
+      const portStr = rest.slice(1).trim();
+      if (!/^\d+$/.test(portStr)) {
+        throw new Error(`端口号非法: ${portStr}`);
+      }
+      port = Number(portStr);
+    } else {
+      throw new Error(`主机端口格式非法: "${hostPort}"`);
+    }
+  } else {
+    const colonCount = (hostPort.match(/:/g) || []).length;
+    if (colonCount > 1) {
+      throw new Error(`IPv6 主机地址必须使用方括号包裹，例如 [::1]:port: "${hostPort}"`);
+    }
+    if (colonCount === 1) {
+      const colonIdx = hostPort.indexOf(':');
+      server = hostPort.slice(0, colonIdx).trim();
+      const portStr = hostPort.slice(colonIdx + 1).trim();
+      if (!/^\d+$/.test(portStr)) {
+        throw new Error(`端口号非法: ${portStr}`);
+      }
+      port = Number(portStr);
+    } else {
+      server = hostPort;
+      if (defaultPort === undefined) {
+        throw new Error(`链接缺少端口号: "${hostPort}"`);
+      }
+      port = defaultPort;
+    }
+  }
+
+  return { server, port };
+}
+
 /**
  * 弹性 URI 拆解器
  * 兼容标准 URL、未转义字符、纯 Base64 Authority、复合 Base64 全链接
@@ -107,40 +161,7 @@ function parseFlexibleUri(
   const hostPort = pathSlashIdx !== -1 ? rawHostPort.slice(0, pathSlashIdx).trim() : rawHostPort;
 
   // 5. 提取 server 与 port (支持 IPv6 [::1]:port)
-  let server = '';
-  let port = defaultPort;
-
-  if (hostPort.startsWith('[')) {
-    const closeBracket = hostPort.indexOf(']');
-    if (closeBracket !== -1) {
-      server = hostPort.slice(1, closeBracket);
-      const rest = hostPort.slice(closeBracket + 1);
-      if (rest.startsWith(':')) {
-        const portStr = rest.slice(1).trim();
-        if (!/^\d+$/.test(portStr)) {
-          throw new Error(`端口号非法: ${portStr}`);
-        }
-        port = Number(portStr);
-      }
-    } else {
-      server = hostPort;
-    }
-  } else {
-    const colonIdx = hostPort.lastIndexOf(':');
-    if (colonIdx !== -1) {
-      server = hostPort.slice(0, colonIdx);
-      const portStr = hostPort.slice(colonIdx + 1).trim();
-      if (!/^\d+$/.test(portStr)) {
-        throw new Error(`端口号非法: ${portStr}`);
-      }
-      port = Number(portStr);
-    } else {
-      server = hostPort;
-    }
-  }
-
-  // 处理可能包含的 IPv6 方括号清理
-  server = server.replace(/^\[(.*)\]$/, '$1').trim();
+  const { server, port } = parseHostAndPort(hostPort, defaultPort);
 
   if (!isValidPort(port)) {
     throw new Error(`端口号非法 (必须为 1-65535 的有效整数): ${port}`);
@@ -538,31 +559,20 @@ export function parseShadowsocks(rawUri: string, subscriptionId: string = ''): P
     cipher = userinfo.slice(0, colonIdx);
     password = userinfo.slice(colonIdx + 1);
 
-    // 解析 server:port 与 query
-    const slashIdx = hostAndQuery.indexOf('/');
-    let hostPortStr = hostAndQuery;
-    let queryStr = '';
-    if (slashIdx !== -1) {
-      hostPortStr = hostAndQuery.slice(0, slashIdx);
-      queryStr = hostAndQuery.slice(slashIdx + 1);
-    } else if (hostAndQuery.includes('?')) {
-      const qIdx = hostAndQuery.indexOf('?');
-      hostPortStr = hostAndQuery.slice(0, qIdx);
-      queryStr = hostAndQuery.slice(qIdx + 1);
-    }
+    // 解析 server:port 与 query：必须先拆分 ? 查询串，再剥离主体中的 / 路径，防止 plugin=...;path=/ws 被提前截断
+    const qIdx = hostAndQuery.indexOf('?');
+    const beforeQuery = qIdx !== -1 ? hostAndQuery.slice(0, qIdx) : hostAndQuery;
+    const queryStr = qIdx !== -1 ? hostAndQuery.slice(qIdx + 1) : '';
+    const slashIdx = beforeQuery.indexOf('/');
+    const hostPortStr = (slashIdx !== -1 ? beforeQuery.slice(0, slashIdx) : beforeQuery).trim();
 
     if (queryStr) {
-      queryParams = new URLSearchParams(
-        queryStr.startsWith('?') ? queryStr.slice(1) : queryStr
-      );
+      queryParams = new URLSearchParams(queryStr);
     }
 
-    const hostColon = hostPortStr.lastIndexOf(':');
-    if (hostColon === -1) {
-      throw new Error('Shadowsocks 链接缺少端口号');
-    }
-    server = hostPortStr.slice(0, hostColon).replace(/^\[(.*)\]$/, '$1').trim();
-    port = Number(hostPortStr.slice(hostColon + 1));
+    const parsedHostPort = parseHostAndPort(hostPortStr);
+    server = parsedHostPort.server;
+    port = parsedHostPort.port;
 
     // 解析 plugin 参数
     if (queryParams) {
@@ -588,12 +598,15 @@ export function parseShadowsocks(rawUri: string, subscriptionId: string = ''): P
     const hostPort = decoded.slice(atIdx + 1);
 
     const colon1 = userinfo.indexOf(':');
+    if (colon1 === -1) {
+      throw new Error('Shadowsocks 传统链接用户信息缺少冒号分隔');
+    }
     cipher = userinfo.slice(0, colon1);
     password = userinfo.slice(colon1 + 1);
 
-    const colon2 = hostPort.lastIndexOf(':');
-    server = hostPort.slice(0, colon2).replace(/^\[(.*)\]$/, '$1');
-    port = Number(hostPort.slice(colon2 + 1)) || 8388;
+    const parsedHostPort = parseHostAndPort(hostPort, 8388);
+    server = parsedHostPort.server;
+    port = parsedHostPort.port;
   }
 
   if (!server || !cipher || !isValidServer(server) || !isValidPort(port)) {

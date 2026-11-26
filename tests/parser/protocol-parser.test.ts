@@ -341,3 +341,110 @@ describe('9. Mihomo (Clash Meta) 标准配置转换测试', () => {
     assert.strictEqual(mihomoConfig.ports, '20000-40000');
   });
 });
+
+describe('10. Batch 6 解析与配置生成安全加固专项测试', () => {
+  it('1. SS URI 包含 plugin=v2ray-plugin;path=/ws 时不再被 / 截断', () => {
+    const uri = `ss://${safeBase64Encode('aes-256-gcm:pass123')}@ss-ws.example.com:8388?plugin=v2ray-plugin;mode=websocket;path=/ws#SS-WS`;
+    const node = parseShadowsocks(uri);
+    assert.strictEqual(node.server, 'ss-ws.example.com');
+    assert.strictEqual(node.port, 8388);
+    assert.strictEqual(node.name, 'SS-WS');
+    const cfg = node.protocolConfig as any;
+    assert.strictEqual(cfg.plugin, 'v2ray-plugin');
+    assert.strictEqual(cfg.pluginOpts, 'mode=websocket;path=/ws');
+  });
+
+  it('2. IPv6 Shadowsocks URI (SIP002 与传统 Base64 格式) 正常解析且严格校验端口与括号', () => {
+    const sip002Ipv6 = `ss://${safeBase64Encode('chacha20-ietf-poly1305:secret')}@[2001:db8::1]:8388/?plugin=v2ray-plugin;path=/v6#IPv6-SS`;
+    const node1 = parseShadowsocks(sip002Ipv6);
+    assert.strictEqual(node1.server, '2001:db8::1');
+    assert.strictEqual(node1.port, 8388);
+    assert.strictEqual((node1.protocolConfig as any).pluginOpts, 'path=/v6');
+
+    const legacyIpv6 = `ss://${safeBase64Encode('aes-128-gcm:secret@[2001:db8::2]:9443')}#Legacy-IPv6`;
+    const node2 = parseShadowsocks(legacyIpv6);
+    assert.strictEqual(node2.server, '2001:db8::2');
+    assert.strictEqual(node2.port, 9443);
+
+    assert.throws(
+      () => parseShadowsocks(`ss://${safeBase64Encode('aes-128-gcm:secret')}@[2001:db8::1]#NoPort`),
+      /端口号/
+    );
+  });
+
+  it('3. 双重与三重嵌套 Base64 订阅可通过 isLikelyBase64 与 smartParse 正常解码，且超过上限安全停止', () => {
+    const doubleEncoded = safeBase64Encode(SAMPLE_BASE64_SUBSCRIPTION);
+    assert.strictEqual(isLikelyBase64(doubleEncoded), true, '双重 Base64 订阅必须被识别为合法 Base64');
+
+    const parsedDouble = smartParse(doubleEncoded);
+    assert.strictEqual(parsedDouble.success, true);
+    assert.strictEqual(parsedDouble.format, 'base64-blob');
+    assert.strictEqual(parsedDouble.nodes.length, 10);
+
+    const tripleEncoded = safeBase64Encode(doubleEncoded);
+    const parsedTriple = smartParse(tripleEncoded);
+    assert.strictEqual(parsedTriple.success, true);
+    assert.strictEqual(parsedTriple.nodes.length, 10);
+
+    // 超过递归上限 (6 层 > MAX_BASE64_SNIFF_DEPTH=5) 安全返回 false 不死循环
+    let deep = SAMPLE_BASE64_SUBSCRIPTION;
+    for (let i = 0; i < 6; i++) {
+      deep = safeBase64Encode(deep);
+    }
+    assert.strictEqual(isLikelyBase64(deep), false);
+  });
+
+  it('4. proxyNodeToMihomo 阻断 __proto__/constructor 原型污染与核心字段篡改，并拒绝缺省假凭证', () => {
+    const maliciousRaw = JSON.parse(
+      '{"__proto__":{"pollutedBatch6":"yes"},"constructor":{"prototype":{"evil":true}},"server":"attacker.invalid","port":9999,"external-controller":"0.0.0.0:9099","dialer-proxy":"RelayGroup","ws-opts":{"path":"/ok","__proto__":{"nestedPolluted":"yes"}}}'
+    );
+
+    const mihomoDict = proxyNodeToMihomo({
+      id: 'custom-1',
+      name: 'CustomSafe',
+      type: 'custom-type' as any,
+      server: 'origin.example.com',
+      port: 443,
+      rawConfig: maliciousRaw,
+    });
+
+    assert.strictEqual(({} as any).pollutedBatch6, undefined, 'Object.prototype 绝不能被污染');
+    assert.strictEqual(({} as any).evil, undefined, 'constructor.prototype 绝不能被污染');
+    assert.strictEqual(mihomoDict.server, 'origin.example.com', 'rawConfig 不得覆盖核心 server 字段');
+    assert.strictEqual(mihomoDict.port, 443, 'rawConfig 不得覆盖核心 port 字段');
+    assert.strictEqual(mihomoDict['external-controller'], undefined, '非白名单危险字段必须被过滤');
+    assert.strictEqual(mihomoDict['dialer-proxy'], 'RelayGroup', '白名单扩展字段应正常保留');
+    assert.strictEqual(mihomoDict['ws-opts'].path, '/ok');
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(mihomoDict['ws-opts'], '__proto__'), false);
+
+    // 缺失必选认证字段时拒绝生成假默认值 ('00000000-...' / 'mockpassword123')
+    assert.throws(
+      () => proxyNodeToMihomo({ id: 'bad-vless', name: 'BadVless', type: 'vless', server: '1.1.1.1', port: 443 }),
+      /缺少必需的 uuid/
+    );
+    assert.throws(
+      () => proxyNodeToMihomo({ id: 'bad-ss', name: 'BadSS', type: 'ss', server: '1.1.1.1', port: 8388 }),
+      /缺少必需的 password/
+    );
+    assert.throws(
+      () => proxyNodeToMihomo({ id: 'bad-trojan', name: 'BadTrojan', type: 'trojan', server: '1.1.1.1', port: 443 }),
+      /缺少必需的 password/
+    );
+    assert.throws(
+      () => proxyNodeToMihomo({ id: 'bad-hy2', name: 'BadHy2', type: 'hysteria2', server: '1.1.1.1', port: 443 }),
+      /缺少必需的 password\/auth/
+    );
+    assert.throws(
+      () => proxyNodeToMihomo({ id: 'bad-wg', name: 'BadWG', type: 'wireguard', server: '1.1.1.1', port: 51820 }),
+      /缺少必需的 privateKey/
+    );
+  });
+
+  it('5. Reality spiderX 参数应从 URI 解析并完整透传至 reality-opts.spider-x', () => {
+    const node = parseVless(SAMPLE_CF_CLEAN_IP_VLESS_REALITY);
+    assert.strictEqual((node.protocolConfig as any).reality?.spiderX, '/HesarWeb');
+
+    const mihomoConfig = proxyNodeToMihomo(node);
+    assert.strictEqual(mihomoConfig['reality-opts']['spider-x'], '/HesarWeb');
+  });
+});
