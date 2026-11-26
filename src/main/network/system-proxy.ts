@@ -11,19 +11,21 @@ import fs from 'fs';
 import net from 'net';
 import type { SystemProxyConfig } from '../../shared/types';
 import { isValidPort } from '../../services/node/node-utils';
-import { proxyGuard } from './proxy-guard';
+import {
+  buildProxyRestorePlan,
+  isPortMatching,
+  proxyGuard,
+  type OriginalProxyBackup,
+  type ProxyRestorePlan,
+} from './proxy-guard';
+
+export { buildProxyRestorePlan, isPortMatching };
+export type { OriginalProxyBackup, ProxyRestorePlan };
 
 const execFileAsync = util.promisify(execFile);
 
 const REG_KEY = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
 const WIN_REG_PATH = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
-
-export interface OriginalProxyBackup {
-  proxyEnable: number;
-  proxyServer?: string;
-  proxyOverride?: string;
-  autoConfigURL?: string;
-}
 
 /**
  * 探测指定本地端口是否有程序在监听
@@ -55,18 +57,6 @@ export function isPortListening(port: number, host: string = '127.0.0.1', timeou
 }
 
 /**
- * 判断代理服务器字符串是否包含指定端口
- */
-export function isPortMatching(server: string | undefined, port: number): boolean {
-  if (!server) return false;
-  const trimmed = server.trim().toLowerCase();
-  const isLoopback = /(?:^|[=;\s])(?:127\.0\.0\.1|localhost):/.test(trimmed);
-  if (!isLoopback) return false;
-  const regex = new RegExp(`:${port}(?:[^0-9]|$)`);
-  return regex.test(trimmed);
-}
-
-/**
  * 同步快速读取 Windows 注册表实时的当前代理配置（5-15ms 原生极速，不依赖 PowerShell，零黑框弹窗）
  */
 export function getLiveRegistryProxySync(): {
@@ -74,6 +64,7 @@ export function getLiveRegistryProxySync(): {
   server?: string;
   override?: string;
   autoConfigURL?: string;
+  readFailed?: boolean;
 } {
   if (process.platform !== 'win32') {
     return { enabled: false };
@@ -96,7 +87,7 @@ export function getLiveRegistryProxySync(): {
     };
   } catch (err: any) {
     console.warn('[SystemProxy] 获取实时注册表代理失败:', err?.message);
-    return { enabled: false };
+    return { enabled: false, readFailed: true };
   }
 }
 
@@ -136,6 +127,9 @@ export class SystemProxyManager {
   private originalBackup: OriginalProxyBackup | null = null;
   private isNexLinkControlling: boolean = false;
   private backupFilePath: string | null = null;
+  private backupFailed: boolean = false;
+  private lastBackupError: string | null = null;
+  private readLiveProxyFn: () => ReturnType<typeof getLiveRegistryProxySync> = getLiveRegistryProxySync;
 
   /**
    * 初始化存储目录并从磁盘恢复原始代理备份
@@ -224,14 +218,24 @@ export class SystemProxyManager {
   /**
    * 备份用户原本的系统代理配置（仅在首次由 NexLink 接管前记录一次）
    * "死代理"只在备份阶段判断：端口等于 NexLink 自己的端口，或本机该端口没有程序监听（用 net.connect 探测）
+   * 若注册表读取失败则明确标记 backupFailed 状态并中止接管，绝不盲写 { proxyEnable: 0 } 覆盖用户原有代理/PAC
    */
-  async backupOriginalSettings(expectedPort: number = 7890): Promise<void> {
+  async backupOriginalSettings(expectedPort: number = 7890): Promise<boolean> {
     if (this.originalBackup !== null) {
-      return; // 已有备份，无需重复覆盖
+      this.backupFailed = false;
+      this.lastBackupError = null;
+      return true; // 已有备份，无需重复覆盖
     }
 
     try {
-      const reg = getLiveRegistryProxySync();
+      const reg = this.readLiveProxyFn();
+      if (reg.readFailed) {
+        this.backupFailed = true;
+        this.lastBackupError = '读取当前 Windows 系统代理注册表失败，已拒绝覆盖原有外部代理/PAC 配置';
+        console.error('[SystemProxy]', this.lastBackupError);
+        return false;
+      }
+
       const isEnabled = reg.enabled;
       const server = (reg.server || '').trim();
 
@@ -259,9 +263,11 @@ export class SystemProxyManager {
       }
 
       if (isDeadProxy) {
-        console.warn(`[SystemProxy] 检测到残留的本地死代理 (${server})，自动纠偏为直连 (ProxyEnable=0)`);
+        console.warn(`[SystemProxy] 检测到残留的本地死代理 (${server})，自动纠偏为直连并保留原有 ProxyOverride/PAC (ProxyEnable=0)`);
         this.originalBackup = {
           proxyEnable: 0,
+          proxyOverride: reg.override || undefined,
+          autoConfigURL: reg.autoConfigURL || undefined,
         };
       } else {
         this.originalBackup = {
@@ -271,12 +277,16 @@ export class SystemProxyManager {
           autoConfigURL: reg.autoConfigURL || undefined,
         };
       }
+      this.backupFailed = false;
+      this.lastBackupError = null;
       this.saveBackupToDisk();
       console.log('[SystemProxy] 成功备份用户原始代理设置:', this.originalBackup);
+      return true;
     } catch (err: any) {
-      console.warn('[SystemProxy] 备份用户原始代理设置警告:', err.message);
-      this.originalBackup = { proxyEnable: 0 };
-      this.saveBackupToDisk();
+      this.backupFailed = true;
+      this.lastBackupError = err?.message || '备份用户原始代理设置异常';
+      console.error('[SystemProxy] 备份用户原始代理设置失败，已拒绝强行接管:', this.lastBackupError);
+      return false;
     }
   }
 
@@ -289,7 +299,11 @@ export class SystemProxyManager {
       return false;
     }
 
-    await this.backupOriginalSettings(port);
+    const backupReady = await this.backupOriginalSettings(port);
+    if (!backupReady) {
+      console.error('[SystemProxy] 因原始代理备份失败，中止开启系统代理以保护用户原有网络设置');
+      return false;
+    }
 
     const proxyServer = `127.0.0.1:${port}`;
     // 严格净化白名单参数，只允许合法域名、IP与标点符号，坚决防范 PowerShell 命令注入
@@ -322,8 +336,13 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
       await runPowerShell(script);
       this.isNexLinkControlling = true;
       console.log(`[SystemProxy] 系统代理已成功设置为: ${proxyServer}`);
-      // 启动独立脱离控制台的守护看门狗，彻底防范直接关闭终端窗口、非正常杀进程或崩溃导致的断网
-      proxyGuard.startGuard({ parentPid: process.pid, proxyPort: port, mihomoPid });
+      // 启动独立脱离控制台的守护看门狗，传入 proxy-backup.json 路径以便异常消亡时精准还原 PAC/第三方代理
+      proxyGuard.startGuard({
+        parentPid: process.pid,
+        proxyPort: port,
+        mihomoPid,
+        backupFilePath: this.backupFilePath || undefined,
+      });
       return true;
     } catch (err: any) {
       console.error('[SystemProxy] 开启系统代理失败:', err.message);
@@ -337,8 +356,16 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
   async restoreProxy(expectedPort: number = 7890): Promise<boolean> {
     if (process.platform !== 'win32') return true;
 
+    if (!this.originalBackup) {
+      this.loadBackupFromDisk();
+    }
+
     // 1. 读取 Windows 注册表实时的当前代理状态
-    const live = getLiveRegistryProxySync();
+    const live = this.readLiveProxyFn();
+    if (live.readFailed) {
+      console.warn('[SystemProxy] 异步恢复前无法读取实时注册表，跳过写操作避免误伤外部代理');
+      return false;
+    }
 
     // 关键安全隔离 1：如果当前注册表中配置了代理，且该代理端口指向其他客户端（即不等于 NexLink 的 expectedPort）
     // 无论 NexLink 内部状态如何，坚决不触碰注册表！绝不误杀正在运行的 Clash Verge、v2rayN 等其他客户端！
@@ -356,32 +383,22 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
       return true;
     }
 
-    const backup = this.originalBackup || { proxyEnable: 0 };
-    const hasOtherClientBackup =
-      backup.proxyEnable === 1 &&
-      Boolean(backup.proxyServer) &&
-      !isPortMatching(backup.proxyServer, expectedPort);
+    const plan = buildProxyRestorePlan(this.originalBackup, expectedPort);
 
     const psEscape = (val: string) => val.replace(/'/g, "''").replace(/[\r\n]/g, '');
-    let script = '';
-    if (hasOtherClientBackup && backup.proxyServer) {
-      // 用户之前本身有开启其他第三方代理，按备份原样安全恢复
-      script = `
-Set-ItemProperty -Path '${REG_KEY}' -Name ProxyEnable -Value 1 -Type DWord
-Set-ItemProperty -Path '${REG_KEY}' -Name ProxyServer -Value '${psEscape(backup.proxyServer)}' -Type String
+    let script = `
+Set-ItemProperty -Path '${REG_KEY}' -Name ProxyEnable -Value ${plan.proxyEnable} -Type DWord
+Set-ItemProperty -Path '${REG_KEY}' -Name ProxyServer -Value '${psEscape(plan.proxyServer)}' -Type String
 `;
+    if (plan.proxyOverride !== null) {
+      script += `Set-ItemProperty -Path '${REG_KEY}' -Name ProxyOverride -Value '${psEscape(plan.proxyOverride)}' -Type String\n`;
     } else {
-      // 用户之前未开启其他代理，安全关闭直连并彻底清空 ProxyServer，防止残留死代理
-      script = `
-Set-ItemProperty -Path '${REG_KEY}' -Name ProxyEnable -Value 0 -Type DWord
-Set-ItemProperty -Path '${REG_KEY}' -Name ProxyServer -Value '' -Type String
-`;
+      script += `Remove-ItemProperty -Path '${REG_KEY}' -Name ProxyOverride -ErrorAction SilentlyContinue\n`;
     }
-    if (backup.proxyOverride) {
-      script += `Set-ItemProperty -Path '${REG_KEY}' -Name ProxyOverride -Value '${psEscape(backup.proxyOverride)}' -Type String\n`;
-    }
-    if (backup.autoConfigURL) {
-      script += `Set-ItemProperty -Path '${REG_KEY}' -Name AutoConfigURL -Value '${psEscape(backup.autoConfigURL)}' -Type String\n`;
+    if (plan.autoConfigURL !== null) {
+      script += `Set-ItemProperty -Path '${REG_KEY}' -Name AutoConfigURL -Value '${psEscape(plan.autoConfigURL)}' -Type String\n`;
+    } else {
+      script += `Remove-ItemProperty -Path '${REG_KEY}' -Name AutoConfigURL -ErrorAction SilentlyContinue\n`;
     }
 
     script += `
@@ -419,8 +436,16 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
   public restoreProxySync(expectedPort: number = 7890): boolean {
     if (process.platform !== 'win32') return true;
 
+    if (!this.originalBackup) {
+      this.loadBackupFromDisk();
+    }
+
     // 1. 读取 Windows 注册表实时的当前代理状态
-    const live = getLiveRegistryProxySync();
+    const live = this.readLiveProxyFn();
+    if (live.readFailed) {
+      console.warn('[SystemProxy] 同步恢复前无法读取实时注册表，跳过写操作避免误伤外部代理');
+      return false;
+    }
 
     // 关键安全隔离 1：如果当前注册表中配置了代理，且该代理端口指向其他客户端（即不等于 NexLink 的 expectedPort）
     // 无论 NexLink 内部状态如何，坚决不触碰注册表！绝不误杀正在运行的 Clash Verge、v2rayN 等其他客户端！
@@ -440,31 +465,47 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
     }
 
     try {
-      const backup = this.originalBackup || { proxyEnable: 0 };
-
-      // 检查原备份是否是指向其他有效客户端（非 NexLink 自己）
-      const hasOtherClientBackup =
-        backup.proxyEnable === 1 &&
-        Boolean(backup.proxyServer) &&
-        !isPortMatching(backup.proxyServer, expectedPort);
-
-      if (hasOtherClientBackup && backup.proxyServer) {
-        execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '1', '/f'], { timeout: 2000, windowsHide: true });
-        execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', backup.proxyServer, '/f'], { timeout: 2000, windowsHide: true });
-        if (backup.proxyOverride) {
-          execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyOverride', '/t', 'REG_SZ', '/d', backup.proxyOverride, '/f'], { timeout: 2000, windowsHide: true });
+      const plan = buildProxyRestorePlan(this.originalBackup, expectedPort);
+      const deleteRegValueIfPresent = (valueName: string) => {
+        try {
+          execFileSync('reg.exe', ['delete', WIN_REG_PATH, '/v', valueName, '/f'], {
+            timeout: 2000,
+            windowsHide: true,
+          });
+        } catch {
+          // 键原本不存在时 reg delete 返回非零，忽略即可
         }
-        console.log(`[SystemProxy] 已同步恢复用户原本的第三方客户端代理: ${backup.proxyServer}`);
+      };
+
+      execFileSync(
+        'reg.exe',
+        ['add', WIN_REG_PATH, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', String(plan.proxyEnable), '/f'],
+        { timeout: 2000, windowsHide: true }
+      );
+      execFileSync(
+        'reg.exe',
+        ['add', WIN_REG_PATH, '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', plan.proxyServer, '/f'],
+        { timeout: 2000, windowsHide: true }
+      );
+
+      if (plan.proxyOverride !== null) {
+        execFileSync(
+          'reg.exe',
+          ['add', WIN_REG_PATH, '/v', 'ProxyOverride', '/t', 'REG_SZ', '/d', plan.proxyOverride, '/f'],
+          { timeout: 2000, windowsHide: true }
+        );
       } else {
-        execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '0', '/f'], { timeout: 2000, windowsHide: true });
-        execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyServer', '/t', 'REG_SZ', '/d', '', '/f'], { timeout: 2000, windowsHide: true });
-        if (backup.proxyOverride) {
-          execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'ProxyOverride', '/t', 'REG_SZ', '/d', backup.proxyOverride, '/f'], { timeout: 2000, windowsHide: true });
-        }
-        console.log('[SystemProxy] 已同步安全关闭系统代理并清空 ProxyServer，恢复直连');
+        deleteRegValueIfPresent('ProxyOverride');
       }
-      if (backup.autoConfigURL) {
-        execFileSync('reg.exe', ['add', WIN_REG_PATH, '/v', 'AutoConfigURL', '/t', 'REG_SZ', '/d', backup.autoConfigURL, '/f'], { timeout: 2000, windowsHide: true });
+
+      if (plan.autoConfigURL !== null) {
+        execFileSync(
+          'reg.exe',
+          ['add', WIN_REG_PATH, '/v', 'AutoConfigURL', '/t', 'REG_SZ', '/d', plan.autoConfigURL, '/f'],
+          { timeout: 2000, windowsHide: true }
+        );
+      } else {
+        deleteRegValueIfPresent('AutoConfigURL');
       }
 
       // 毫秒级同步触发 WinINet 广播刷新
@@ -505,9 +546,21 @@ public class WinINetFast {
     return this.originalBackup;
   }
 
+  public hasBackupFailed(): boolean {
+    return this.backupFailed;
+  }
+
+  public getLastBackupError(): string | null {
+    return this.lastBackupError;
+  }
+
   public setOriginalBackup(backup: OriginalProxyBackup | null): void {
     this.originalBackup = backup;
     this.isNexLinkControlling = Boolean(backup);
+    if (backup) {
+      this.backupFailed = false;
+      this.lastBackupError = null;
+    }
   }
 }
 
