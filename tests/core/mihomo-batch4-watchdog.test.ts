@@ -1,8 +1,28 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+
+async function allocateFreePort(avoidPorts: number[] = []): Promise<number> {
+  for (let i = 0; i < 10; i++) {
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = net.createServer();
+      server.unref();
+      server.on('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const addr = server.address();
+        const assigned = typeof addr === 'object' && addr ? addr.port : 0;
+        server.close((err) => (err ? reject(err) : resolve(assigned)));
+      });
+    });
+    if (port > 0 && port <= 65533 && !avoidPorts.includes(port)) {
+      return port;
+    }
+  }
+  throw new Error('无法分配到空闲测试端口');
+}
 import { MihomoProcessManager } from '../../src/main/core/mihomo-process';
 import {
   shouldEnableRemoteDebugging,
@@ -197,6 +217,8 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-b4-reload-'));
     try {
+      const mixedPort = await allocateFreePort();
+      const apiPort = await allocateFreePort([mixedPort, mixedPort + 1]);
       const mgr = new MihomoProcessManager();
       mgr.initialize(tmpDir, resourcesDir);
 
@@ -204,8 +226,8 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
         nodes: [],
         settings: {
           ...DEFAULT_SETTINGS,
-          mixedPort: 17910,
-          apiPort: 19110,
+          mixedPort,
+          apiPort,
           systemProxy: false,
           tunMode: false,
           mode: 'rule',
@@ -219,8 +241,8 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
         nodes: [],
         settings: {
           ...DEFAULT_SETTINGS,
-          mixedPort: 17910,
-          apiPort: 19110,
+          mixedPort,
+          apiPort,
           systemProxy: false,
           tunMode: false,
           mode: 'global',
@@ -239,8 +261,8 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
         nodes: [],
         settings: {
           ...DEFAULT_SETTINGS,
-          mixedPort: 17910,
-          apiPort: 19110,
+          mixedPort,
+          apiPort,
           systemProxy: false,
           tunMode: true,
           mode: 'direct',

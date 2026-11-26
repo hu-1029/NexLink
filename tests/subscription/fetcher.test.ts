@@ -232,4 +232,57 @@ describe('订阅抓取与解析 fetcher 单元测试', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it('8. TUN Fake-IP 兼容性：仅在 allowFakeIpRange=true 且为域名解析结果时放行 198.18.0.0/16，字面 IP 与其他私网仍严格拦截', async () => {
+    // 1) 未开启 TUN Fake-IP (allowFakeIpRange=false) 时，域名解析返回 198.18.x.x 必须按保留地址拦截
+    await assert.rejects(
+      () =>
+        assertSafeRemoteSubscriptionUrl(
+          'https://sub.example.com/v1',
+          false,
+          async () => [{ address: '198.18.0.5', family: 4 }],
+          false
+        ),
+      /安全拦截/
+    );
+
+    // 2) 开启 TUN Fake-IP (allowFakeIpRange=true) 时，公网域名解析出 198.18.0.5 应正常放行
+    const fakeIpAllowed = await assertSafeRemoteSubscriptionUrl(
+      'https://sub.example.com/v1',
+      false,
+      async () => [{ address: '198.18.0.5', family: 4 }],
+      true
+    );
+    assert.strictEqual(fakeIpAllowed.hostname, 'sub.example.com');
+
+    // 3) 即使处于 Fake-IP 运行态，若 URL 本身是字面 198.18.x.x IP，仍必须严格拦截
+    await assert.rejects(
+      () => assertSafeRemoteSubscriptionUrl('http://198.18.0.1/admin', false, undefined, true),
+      /安全拦截/
+    );
+
+    // 4) 即使处于 Fake-IP 运行态，域名解析返回 198.19.x.x 或 127.0.0.1 / 10.x / 169.254.169.254 / ::1 仍必须严格拦截
+    for (const badResolvedIp of ['198.19.0.1', '127.0.0.1', '10.0.0.1', '169.254.169.254', '::1', 'fe80::1']) {
+      await assert.rejects(
+        () =>
+          assertSafeRemoteSubscriptionUrl(
+            'https://sub.example.com/v1',
+            false,
+            async () => [{ address: badResolvedIp, family: badResolvedIp.includes(':') ? 6 : 4 }],
+            true
+          ),
+        /安全拦截/,
+        `Fake-IP 模式下仍应严格拦截非 198.18/16 的私有/保留地址: ${badResolvedIp}`
+      );
+    }
+
+    // 5) fetchSubscription 入口透传 allowFakeIpRange 与 lookupFn 行为一致（字面 198.18 仍阻断）
+    const literalRes = await fetchSubscription('http://198.18.0.1/admin', {
+      retries: 0,
+      timeoutMs: 500,
+      allowFakeIpRange: true,
+    });
+    assert.strictEqual(literalRes.success, false);
+    assert.match(literalRes.error || '', /安全拦截/);
+  });
 });

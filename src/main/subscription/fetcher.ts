@@ -84,6 +84,7 @@ export interface FetchOptions {
   retryDelayMs?: number;
   allowedBaseDir?: string;
   allowPrivateNetwork?: boolean;
+  allowFakeIpRange?: boolean;
   lookupFn?: DnsLookupFn;
 }
 
@@ -190,6 +191,16 @@ export function isPrivateOrReservedIp(rawIp: string): boolean {
   return true;
 }
 
+function isFakeIpAddress(rawIp: string): boolean {
+  const cleaned = rawIp.trim().replace(/^\[|\]$/g, '').split('%')[0];
+  if (net.isIP(cleaned) !== 4) {
+    return false;
+  }
+  const parts = cleaned.split('.').map((p) => Number(p));
+  // Mihomo TUN Fake-IP 默认配置网段: 198.18.0.1/16 (仅放行 198.18.x.x)
+  return parts.length === 4 && parts[0] === 198 && parts[1] === 18;
+}
+
 function createSsrfError(message: string): Error & { noRetry: boolean } {
   const err = new Error(message) as Error & { noRetry: boolean };
   err.noRetry = true;
@@ -198,11 +209,14 @@ function createSsrfError(message: string): Error & { noRetry: boolean } {
 
 /**
  * 校验远程订阅 URL 安全性：仅允许 http/https，并拦截回环、私网、云元数据及本地内部域名（SSRF 防护）
+ * 当 TUN Fake-IP 模式激活 (allowFakeIpRange=true) 时，允许公网域名经系统 DNS 解析出的 198.18.0.0/16 地址，
+ * 但若 URL 主机名本身为字面 IP（如 http://198.18.0.1/...）仍严格拦截。
  */
 export async function assertSafeRemoteSubscriptionUrl(
   rawUrl: string,
   allowPrivateNetwork: boolean = false,
-  lookupFn?: DnsLookupFn
+  lookupFn?: DnsLookupFn,
+  allowFakeIpRange: boolean = false
 ): Promise<URL> {
   let parsed: URL;
   try {
@@ -247,6 +261,9 @@ export async function assertSafeRemoteSubscriptionUrl(
     throw new Error(`无法解析远程订阅域名: ${hostname}`);
   }
   for (const rec of records) {
+    if (allowFakeIpRange && isFakeIpAddress(rec.address)) {
+      continue;
+    }
     if (isPrivateOrReservedIp(rec.address)) {
       throw createSsrfError(
         `安全拦截: 远程订阅域名 ${hostname} 解析到了禁止访问的私网/保留 IP (${rec.address})`
@@ -586,9 +603,15 @@ export async function fetchSubscription(
   }
 
   const allowPrivateNetwork = options?.allowPrivateNetwork === true;
+  const allowFakeIpRange = options?.allowFakeIpRange === true;
   const lookupFn = options?.lookupFn;
   const validateRemoteUrl = async (targetUrl: string): Promise<void> => {
-    await assertSafeRemoteSubscriptionUrl(targetUrl, allowPrivateNetwork, lookupFn);
+    await assertSafeRemoteSubscriptionUrl(
+      targetUrl,
+      allowPrivateNetwork,
+      lookupFn,
+      allowFakeIpRange
+    );
   };
 
   const timeoutMs = options?.timeoutMs ?? 15000;

@@ -114,8 +114,17 @@ export class SubscriptionManager {
       this.storage.saveSubscriptions([...initialSubs]);
       this.onDataChangedCallback?.();
 
+      const coreStatus = this.mihomo.getStatus();
+      const currentSettings = this.storage.getSettings();
+      const allowFakeIpRange = Boolean(
+        coreStatus?.running &&
+          coreStatus?.tunActive &&
+          (currentSettings.dns?.enhancedMode || 'fake-ip') === 'fake-ip'
+      );
+
       const fetchResult = await fetchSubscription(fetchSnapshot, {
         allowedBaseDir: this.storage.getBaseDir(),
+        allowFakeIpRange,
       });
       const now = Date.now();
       const dateObj = new Date(now);
