@@ -1,5 +1,13 @@
 !include "LogicLib.nsh"
 
+; 允许用户在安装目录页直接选择磁盘根目录（如 D:\），随后由 electron-builder 的 instFilesPre 自动补全 \NexLink，杜绝按钮置灰
+AllowRootDirInstall true
+
+!macro customInstall
+  GetFullPathName $INSTDIR "$INSTDIR"
+  StrCpy $appExe "$INSTDIR\${APP_EXECUTABLE_FILENAME}"
+!macroend
+
 !macro customUnInstall
   ${ifNot} ${isUpdated}
     ReadEnvStr $4 ProgramData

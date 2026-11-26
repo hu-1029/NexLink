@@ -261,6 +261,7 @@ Write-Output 'AST_OK'
 
   it('6. Patch C: build/installer.nsh 卸载清代理脚本具备 C:\\ProgramData 回退、TCP 端口探测且经 AST 解析 0 语法错误', () => {
     const nsh = fs.readFileSync(path.resolve('build/installer.nsh'), 'utf8');
+    assert.ok(nsh.includes('AllowRootDirInstall true'), '必须允许选择磁盘根目录后由 instFilesPre 自动补全 \\NexLink');
     assert.ok(nsh.includes('StrCpy $4 "C:\\ProgramData"'), 'ProgramData 为空时必须回退到 C:\\ProgramData');
     const svcDeleteIdx = nsh.indexOf('sc.exe delete NexLinkCoreService');
     const tcpCleanIdx = nsh.indexOf('System.Net.Sockets.TcpClient');
