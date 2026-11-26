@@ -1489,6 +1489,11 @@ export class MihomoProcessManager {
     // 4. 清算可能残留的孤儿进程与路由黑洞（跳过已由活跃句柄安全终止的同一 PID，杜绝重复终止）
     this.forceKillAllSync(killedLive ? proc?.pid : undefined);
 
+    if (this.currentStatus.tunActive || this.tunActivatedInSession) {
+      await tunServiceManager.cleanupRoutesViaService().catch(() => {});
+      this.tunActivatedInSession = false;
+    }
+
     // 5. 快速确认端口释放回收（最多 800ms，每 50ms 轮询一次）
     for (let i = 0; i < 16; i++) {
       const isFree =
@@ -1785,17 +1790,20 @@ export class MihomoProcessManager {
 
       // 预检校验新配置有效性
       const testConfigPath = path.join(this.runtimeDir, 'config.test.yaml');
-      fs.writeFileSync(testConfigPath, newConfigYaml, 'utf8');
-      const checkRes = await validateMihomoConfig(
-        this.mihomoExePath,
-        testConfigPath,
-        this.runtimeDir
-      );
-
+      let checkRes: { valid: boolean; error?: string };
       try {
-        if (fs.existsSync(testConfigPath)) fs.unlinkSync(testConfigPath);
-      } catch (_e) {
-        void _e;
+        fs.writeFileSync(testConfigPath, newConfigYaml, 'utf8');
+        checkRes = await validateMihomoConfig(
+          this.mihomoExePath,
+          testConfigPath,
+          this.runtimeDir
+        );
+      } finally {
+        try {
+          if (fs.existsSync(testConfigPath)) fs.unlinkSync(testConfigPath);
+        } catch (_e) {
+          void _e;
+        }
       }
 
       if (!checkRes.valid) {
@@ -1863,31 +1871,33 @@ export class MihomoProcessManager {
    * 动态切换核心分流模式 (rule / global / direct)
    */
   public async setMode(mode: 'rule' | 'global' | 'direct'): Promise<boolean> {
-    const prevMode = this.currentStatus.mode;
-    if (this.currentStatus.running) {
-      try {
-        let ok = false;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          ok = await this.apiClient.changeMode(mode);
-          if (ok) break;
-          await new Promise((r) => setTimeout(r, 200));
-        }
-        if (!ok) {
+    return this.withLifecycleLock(async () => {
+      const prevMode = this.currentStatus.mode;
+      if (this.currentStatus.running) {
+        try {
+          let ok = false;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            ok = await this.apiClient.changeMode(mode);
+            if (ok) break;
+            await new Promise((r) => setTimeout(r, 200));
+          }
+          if (!ok) {
+            this.currentStatus.mode = prevMode;
+            return false;
+          }
+          this.currentStatus.mode = mode;
+          this.onStatusCallback?.({ ...this.currentStatus });
+          return true;
+        } catch (err: any) {
           this.currentStatus.mode = prevMode;
+          console.error('[MihomoProcess] 动态切换分流模式异常:', err.message);
           return false;
         }
-        this.currentStatus.mode = mode;
-        this.onStatusCallback?.({ ...this.currentStatus });
-        return true;
-      } catch (err: any) {
-        this.currentStatus.mode = prevMode;
-        console.error('[MihomoProcess] 动态切换分流模式异常:', err.message);
-        return false;
       }
-    }
-    this.currentStatus.mode = mode;
-    this.onStatusCallback?.({ ...this.currentStatus });
-    return true;
+      this.currentStatus.mode = mode;
+      this.onStatusCallback?.({ ...this.currentStatus });
+      return true;
+    });
   }
 
   private attachLogStream(logLevel: string = 'info'): void {

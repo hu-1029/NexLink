@@ -341,6 +341,7 @@ export class MihomoApiClient {
     const controller = new AbortController();
     let isAborted = false;
     let timedOut = false;
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 
     const connectStream = async () => {
       let handshakeTimer: NodeJS.Timeout | null = null;
@@ -367,6 +368,7 @@ export class MihomoApiClient {
         }
 
         const reader = response.body.getReader();
+        activeReader = reader;
         const decoder = new TextDecoder();
         let buffer = '';
 
@@ -401,6 +403,25 @@ export class MihomoApiClient {
             onError?.(err instanceof Error ? err : new Error(String(err?.message || err)));
           }
         }
+      } finally {
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        const readerToCancel = activeReader;
+        activeReader = null;
+        if (readerToCancel) {
+          try {
+            await readerToCancel.cancel();
+          } catch {
+            // ignore cancel error
+          }
+          try {
+            readerToCancel.releaseLock();
+          } catch {
+            // ignore releaseLock error
+          }
+        }
       }
     };
 
@@ -408,6 +429,11 @@ export class MihomoApiClient {
 
     return () => {
       isAborted = true;
+      const readerToCancel = activeReader;
+      activeReader = null;
+      if (readerToCancel) {
+        void readerToCancel.cancel().catch(() => {});
+      }
       controller.abort();
     };
   }

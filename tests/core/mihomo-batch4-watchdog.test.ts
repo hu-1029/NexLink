@@ -25,6 +25,7 @@ async function allocateFreePort(avoidPorts: number[] = []): Promise<number> {
 }
 import { MihomoProcessManager } from '../../src/main/core/mihomo-process';
 import {
+  isAllowedNavigationTarget,
   shouldEnableRemoteDebugging,
   stopWithTimeoutAndFallback,
 } from '../../src/main/index';
@@ -216,11 +217,17 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
     }
 
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexlink-b4-reload-'));
+    const mgr = new MihomoProcessManager();
     try {
       const mixedPort = await allocateFreePort();
       const apiPort = await allocateFreePort([mixedPort, mixedPort + 1]);
-      const mgr = new MihomoProcessManager();
       mgr.initialize(tmpDir, resourcesDir);
+      // 隔离本机已安装的真实特权服务，确保测试始终在临时目录运行受控子进程
+      (mgr as any).tunPrereqCheckHook = async () => ({
+        serviceReady: false,
+        isAdmin: false,
+        driverOk: true,
+      });
 
       const startRes = await mgr.start({
         nodes: [],
@@ -276,6 +283,7 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
 
       await mgr.stop();
     } finally {
+      await mgr.stop().catch(() => {});
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -354,5 +362,78 @@ describe('Batch 4 Service 看门狗、热重载 mode/TUN 同步与退出/调试�
     );
     assert.deepEqual(throwRes, { timedOut: false, stopped: false });
     assert.equal(emergencyCalled, 2, '异常后必须触发紧急清理兜底');
+  });
+
+  it('7. Patch B: isAllowedNavigationTarget 严格校验 origin 与 dist 目录边界，mihomo-process 具备路由/临时文件/锁防护', () => {
+    const distDir = path.resolve('dist');
+    // 1) 开发模式仅匹配精确 origin
+    assert.equal(
+      isAllowedNavigationTarget('http://localhost:5173/dashboard', {
+        isPackaged: false,
+        devServerUrl: 'http://localhost:5173',
+        distDir,
+      }),
+      true
+    );
+    assert.equal(
+      isAllowedNavigationTarget('http://localhost:5173.evil.com/phish', {
+        isPackaged: false,
+        devServerUrl: 'http://localhost:5173',
+        distDir,
+      }),
+      false,
+      '必须拒绝前缀碰撞伪造域名'
+    );
+    assert.equal(
+      isAllowedNavigationTarget('http://localhost:51730/', {
+        isPackaged: false,
+        devServerUrl: 'http://localhost:5173',
+        distDir,
+      }),
+      false
+    );
+
+    // 2) file:// 严格限制在 dist 目录内（防同前缀目录逃逸与大小写绕过）
+    const distIndex = path.join(distDir, 'index.html');
+    const distFileUrl = new URL(`file:///${distIndex.replace(/\\/g, '/')}`).toString();
+    assert.equal(
+      isAllowedNavigationTarget(distFileUrl, { isPackaged: true, distDir }),
+      true
+    );
+    if (process.platform === 'win32') {
+      const upperDistUrl = new URL(`file:///${distIndex.replace(/\\/g, '/').toUpperCase()}`).toString();
+      assert.equal(
+        isAllowedNavigationTarget(upperDistUrl, { isPackaged: true, distDir }),
+        true,
+        'Windows 下必须对盘符和目录大小写归一化'
+      );
+    }
+
+    const evilSibling = path.resolve('dist-evil', 'index.html');
+    const evilSiblingUrl = new URL(`file:///${evilSibling.replace(/\\/g, '/')}`).toString();
+    assert.equal(
+      isAllowedNavigationTarget(evilSiblingUrl, { isPackaged: true, distDir }),
+      false,
+      '必须拒绝 dist-evil 同前缀目录逃逸'
+    );
+    assert.equal(
+      isAllowedNavigationTarget('file:///C:/Windows/win.ini', { isPackaged: true, distDir }),
+      false
+    );
+
+    // 3) mihomo-process.ts 源码契约：stopInternal 清理服务路由、config.test.yaml 在 finally 清理、setMode 持锁
+    const mihomoSrc = fs.readFileSync(path.resolve('src/main/core/mihomo-process.ts'), 'utf8');
+    const stopIdx = mihomoSrc.indexOf('private async stopInternal()');
+    const stopEndIdx = mihomoSrc.indexOf('public startServiceWatchdog(');
+    const stopBody = mihomoSrc.slice(stopIdx, stopEndIdx);
+    assert.ok(stopBody.includes('cleanupRoutesViaService()'), 'stopInternal 必须包含服务侧路由清理');
+
+    const testCfgIdx = mihomoSrc.indexOf("path.join(this.runtimeDir, 'config.test.yaml')");
+    const testCfgBlock = mihomoSrc.slice(testCfgIdx, testCfgIdx + 500);
+    assert.ok(testCfgBlock.includes('finally {'), 'config.test.yaml 清理必须位于 finally 块内');
+
+    const setModeIdx = mihomoSrc.indexOf('public async setMode(');
+    const setModeBlock = mihomoSrc.slice(setModeIdx, setModeIdx + 220);
+    assert.ok(setModeBlock.includes('this.withLifecycleLock('), 'setMode 必须套用 withLifecycleLock');
   });
 });

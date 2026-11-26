@@ -26,6 +26,51 @@ const nativeImage = Electron.nativeImage;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+export function isAllowedNavigationTarget(
+  targetUrl: string,
+  options: { isPackaged: boolean; devServerUrl?: string; distDir: string }
+): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return false;
+  }
+
+  if (!options.isPackaged && options.devServerUrl) {
+    try {
+      const devOrigin = new URL(options.devServerUrl).origin;
+      if (devOrigin && parsed.origin === devOrigin) {
+        return true;
+      }
+    } catch {
+      // ignore invalid devServerUrl
+    }
+    if (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') &&
+      parsed.port === '5173'
+    ) {
+      return true;
+    }
+  }
+
+  if (parsed.protocol === 'file:') {
+    try {
+      const targetPath = path.resolve(fileURLToPath(parsed));
+      const distRoot = path.resolve(options.distDir);
+      const normTarget = process.platform === 'win32' ? targetPath.toLowerCase() : targetPath;
+      const normDist = process.platform === 'win32' ? distRoot.toLowerCase() : distRoot;
+      const distPrefix = normDist.endsWith(path.sep) ? normDist : `${normDist}${path.sep}`;
+      return normTarget === normDist || normTarget.startsWith(distPrefix);
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
 export function shouldEnableRemoteDebugging(
   isPackaged: boolean,
   env: NodeJS.ProcessEnv = process.env,
@@ -514,13 +559,14 @@ function createWindow(resourcesDir?: string): void {
   });
 
   // 安全过滤：拦截同窗口导航逃逸，防止外部页面继承 window.nexlinkAPI
+  const distDir = path.resolve(__dirname, '../../dist');
   mainWindow.webContents.on('will-navigate', (event, targetUrl) => {
-    const isAllowedDev =
-      !app.isPackaged &&
-      devServerUrl &&
-      (/^https?:\/\/(localhost|127\.0\.0\.1):5173\b/i.test(targetUrl) || targetUrl.startsWith(devServerUrl));
-    const isAllowedLocal = targetUrl.startsWith('file://');
-    if (!isAllowedDev && !isAllowedLocal) {
+    const allowed = isAllowedNavigationTarget(targetUrl, {
+      isPackaged: app.isPackaged,
+      devServerUrl,
+      distDir,
+    });
+    if (!allowed) {
       event.preventDefault();
       if (targetUrl.startsWith('https://') || targetUrl.startsWith('http://')) {
         shell.openExternal(targetUrl);

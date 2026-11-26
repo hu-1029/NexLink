@@ -106,4 +106,57 @@ describe('MihomoApiClient SSE 流握手超时保护单元测试', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
+
+  it('3. 主动调用 stop() 时调用 reader.cancel() 立即断开服务端 SSE 长连接', async () => {
+    let serverCloseObserved = false;
+    let closeResolve: (() => void) | null = null;
+    const serverClosedPromise = new Promise<void>((resolve) => {
+      closeResolve = resolve;
+    });
+
+    const server = http.createServer((req, res) => {
+      if (req.url === '/traffic') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write(`${JSON.stringify({ up: 10, down: 20 })}\n`);
+        req.on('close', () => {
+          serverCloseObserved = true;
+          closeResolve?.();
+        });
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+    const port = (server.address() as any).port;
+    const client = new MihomoApiClient(port);
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('未收到首帧流量数据')), 2000);
+        const stop = client.startTrafficStream(
+          () => {
+            clearTimeout(timer);
+            stop();
+            resolve();
+          },
+          (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+          1000
+        );
+      });
+
+      await Promise.race([
+        serverClosedPromise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('stop() 后服务端连接未及时关闭')), 1000)),
+      ]);
+      assert.strictEqual(serverCloseObserved, true);
+    } finally {
+      server.closeAllConnections?.();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
 });
