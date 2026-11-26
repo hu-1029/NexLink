@@ -361,6 +361,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 
   useEffect(() => {
     refreshTunInfraStatus();
+    const onInfraChanged = () => {
+      void refreshTunInfraStatus();
+    };
+    window.addEventListener('focus', onInfraChanged);
+    window.addEventListener('nexlink:tun-infra-changed', onInfraChanged);
+    return () => {
+      window.removeEventListener('focus', onInfraChanged);
+      window.removeEventListener('nexlink:tun-infra-changed', onInfraChanged);
+    };
   }, []);
 
   const handleInstallService = async () => {
@@ -375,6 +384,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         setTunActionMsg({ text: res.error || '服务安装失败', type: 'error' });
       }
       await refreshTunInfraStatus();
+      if (res.success) {
+        setTimeout(() => {
+          void refreshTunInfraStatus();
+        }, 400);
+      }
     } catch (err: any) {
       setTunActionMsg({ text: err?.message || '服务安装异常', type: 'error' });
     } finally {

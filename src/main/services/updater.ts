@@ -45,6 +45,119 @@ export interface SafeFetchOptions {
 }
 
 /**
+ * 使用 Electron.net.request 构造支持手动拦截 3xx 重定向的 Fetch 适配器
+ * （Electron.net.fetch 在 redirect: 'manual' 下遇到 302 会直接抛出 Redirect was cancelled，
+ *  而 Electron.net.request 原生支持 'redirect' 事件与 Chromium 系统代理隧道）
+ */
+async function electronNetRequestFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    if (init.signal?.aborted) {
+      return reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+    }
+
+    const req = Electron.net.request({
+      url,
+      method: (init.method || 'GET').toUpperCase(),
+      redirect: 'manual',
+    });
+
+    if (init.headers) {
+      const h = new Headers(init.headers);
+      h.forEach((value, key) => {
+        req.setHeader(key, value);
+      });
+    }
+
+    let settled = false;
+    const onAbort = () => {
+      if (!settled) {
+        settled = true;
+        try {
+          req.abort();
+        } catch {
+          // ignore
+        }
+        reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }));
+      }
+    };
+    init.signal?.addEventListener('abort', onAbort, { once: true });
+
+    const cleanupSignal = () => {
+      init.signal?.removeEventListener('abort', onAbort);
+    };
+
+    req.on('redirect', (statusCode, _method, redirectUrl, responseHeaders) => {
+      if (settled) return;
+      settled = true;
+      cleanupSignal();
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(responseHeaders || {})) {
+        if (Array.isArray(v)) headers.set(k, v.join(', '));
+        else if (typeof v === 'string') headers.set(k, v);
+      }
+      if (!headers.has('location') && redirectUrl) {
+        headers.set('location', redirectUrl);
+      }
+      try {
+        req.abort();
+      } catch {
+        // ignore
+      }
+      resolve(new Response(null, { status: statusCode, headers }));
+    });
+
+    req.on('response', (res) => {
+      if (settled) return;
+      settled = true;
+      const headers = new Headers();
+      for (const [k, v] of Object.entries(res.headers || {})) {
+        if (Array.isArray(v)) headers.set(k, v.join(', '));
+        else if (typeof v === 'string') headers.set(k, v);
+      }
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          res.on('data', (chunk: Buffer) => {
+            controller.enqueue(new Uint8Array(chunk));
+          });
+          res.on('end', () => {
+            cleanupSignal();
+            controller.close();
+          });
+          res.on('error', (err: Error) => {
+            cleanupSignal();
+            controller.error(err);
+          });
+        },
+        cancel() {
+          cleanupSignal();
+          try {
+            req.abort();
+          } catch {
+            // ignore
+          }
+        },
+      });
+      resolve(
+        new Response(stream, {
+          status: res.statusCode,
+          statusText: res.statusMessage,
+          headers,
+        })
+      );
+    });
+
+    req.on('error', (err: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanupSignal();
+      reject(err);
+    });
+
+    req.end();
+  });
+}
+
+/**
  * 禁止自动盲跟随 3xx：逐跳手动校验重定向目标域名，防止开放重定向/域名绕过
  */
 export async function fetchWithSafeRedirects(
@@ -54,7 +167,9 @@ export async function fetchWithSafeRedirects(
 ): Promise<Response> {
   const maxRedirects = options?.maxRedirects ?? 6;
   const validateUrl = options?.validateUrl ?? isValidGithubReleaseUrl;
-  const fetchFn = options?.fetchFn ?? ((Electron.net?.fetch as typeof fetch) || globalThis.fetch);
+  const fetchFn =
+    options?.fetchFn ??
+    (typeof Electron.net?.request === 'function' ? electronNetRequestFetch : globalThis.fetch);
 
   let currentUrl = initialUrl;
   for (let hop = 0; hop <= maxRedirects; hop++) {

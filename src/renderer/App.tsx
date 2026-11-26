@@ -311,6 +311,7 @@ export const App: React.FC = () => {
 
       const updated = await window.nexlinkAPI.system.updateSettings({ tunMode: true });
       if (updated) setSettings((prev) => ({ ...prev, ...updated }));
+      window.dispatchEvent(new CustomEvent('nexlink:tun-infra-changed'));
       setIsTunServiceModalOpen(false);
     } catch (err: any) {
       setTunServiceModalError(err?.message || '安装虚拟网卡服务异常');
