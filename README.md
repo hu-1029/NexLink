@@ -74,7 +74,9 @@ NexLink/
 │   ├── mihomo/                  # Mihomo 内核与 wintun.dll 驱动
 │   └── rules/                   # 规则资源 (Country.mmdb, ASN.mmdb, geoip, geosite)
 ├── tests/                       # 自动化测试套件
-└── docs/                        # 项目技术设计与架构文档
+├── docs/                        # 项目技术设计与架构文档
+├── LICENSE                      # GNU General Public License v3.0 协议全文
+└── THIRD_PARTY_NOTICES.md       # 第三方组件与规则数据声明
 ```
 
 ---
@@ -110,4 +112,6 @@ npm run dist
 
 ## 📜 开源协议
 
-本项目采用 [MIT 许可证](LICENSE) 进行开源。
+Copyright (C) 2026 hu-1029
+
+本项目采用 [GNU General Public License v3.0 (GPL-3.0)](LICENSE) 协议开源，第三方组件与规则数据声明详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

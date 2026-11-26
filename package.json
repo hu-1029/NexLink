@@ -1,6 +1,8 @@
 {
   "name": "nexlink",
   "version": "0.1.0",
+  "license": "GPL-3.0",
+  "author": "hu-1029",
   "type": "module",
   "description": "新一代现代化 Windows 代理客户端——融合 Clash Verge Rev 现代 UI + v2rayN 全格式自由导入体验",
   "main": "dist-electron/main/index.js",
@@ -16,7 +18,7 @@
   "build": {
     "appId": "com.nexlink.app",
     "productName": "NexLink",
-    "copyright": "Copyright © 2026 NexLink Team",
+    "copyright": "Copyright © 2026 hu-1029",
     "directories": {
       "output": "release"
     },
@@ -31,6 +33,14 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
       }
     ],
     "win": {
