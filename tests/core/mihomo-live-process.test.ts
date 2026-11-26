@@ -18,6 +18,14 @@ test('Mihomo 真实进程生命周期与 RESTful API 实机集成测试', async 
 
   const runtimeDir = path.resolve('data/runtime');
   mihomoManager.initialize(runtimeDir, resourcesDir);
+  const origTunPrereqHook = (mihomoManager as any).tunPrereqCheckHook;
+  (mihomoManager as any).tunPrereqCheckHook = async () => ({
+    serviceReady: false,
+    isAdmin: false,
+    driverOk: true,
+  });
+
+  try {
 
   await t.test('1. 成功拉起真实 Mihomo 进程并通过 API 握手', async () => {
     const startResult = await mihomoManager.start({
@@ -104,4 +112,8 @@ test('Mihomo 真实进程生命周期与 RESTful API 实机集成测试', async 
     assert.ok(crashContent.includes('Mihomo 异常退出'));
     console.log('  -> 异常退出捕获与 crash.log 崩溃日志记录测试通过');
   });
+  } finally {
+    (mihomoManager as any).tunPrereqCheckHook = origTunPrereqHook;
+    await mihomoManager.stop().catch(() => {});
+  }
 });

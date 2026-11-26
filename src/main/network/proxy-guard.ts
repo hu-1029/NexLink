@@ -26,19 +26,31 @@ export interface GuardOptions {
   parentPid: number;
   proxyPort: number;
   mihomoPid?: number;
+  mihomoExePath?: string;
   backupFilePath?: string;
 }
 
 /**
- * 判断代理服务器字符串是否指向本机指定端口
+ * 判断代理服务器字符串是否指向本机指定端口（按分号逐条解析，支持 127.0.0.1 / localhost / [::1]）
  */
 export function isPortMatching(server: string | undefined, port: number): boolean {
   if (!server) return false;
-  const trimmed = server.trim().toLowerCase();
-  const isLoopback = /(?:^|[=;\s])(?:127\.0\.0\.1|localhost):/.test(trimmed);
-  if (!isLoopback) return false;
-  const regex = new RegExp(`:${port}(?:[^0-9]|$)`);
-  return regex.test(trimmed);
+  const entries = server
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const addr = entry
+      .replace(/^[a-z0-9.+-]+=/i, '')
+      .replace(/^[a-z0-9.+-]+:\/\//i, '')
+      .trim()
+      .toLowerCase();
+    const match = addr.match(/^(127\.0\.0\.1|localhost|\[::1\]):(\d+)$/i);
+    if (match && Number(match[2]) === port) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -102,18 +114,38 @@ export function buildProxyGuardScript(
   options: GuardOptions,
   regPathOverride?: string
 ): string {
-  const { parentPid, proxyPort, mihomoPid, backupFilePath } = options;
+  const { parentPid, proxyPort, mihomoPid, mihomoExePath, backupFilePath } = options;
   const targetRegPath =
     regPathOverride || 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
   const safeRegPath = escapePsSingleQuoted(targetRegPath);
   const safeBackupPath = backupFilePath ? escapePsSingleQuoted(backupFilePath) : '';
+  const safeMihomoPath = mihomoExePath ? escapePsSingleQuoted(mihomoExePath) : '';
 
   return `
 $parentPid = ${parentPid}
 $targetPort = ${proxyPort}
 $mihomoPid = ${mihomoPid || 0}
+$expectedMihomoPath = '${safeMihomoPath}'
 $regPath = '${safeRegPath}'
 $backupFilePath = '${safeBackupPath}'
+
+function Test-ProxyServerMatchesPort([string]$serverStr, [int]$portNum) {
+    if ([string]::IsNullOrWhiteSpace($serverStr)) { return $false }
+    foreach ($entry in ($serverStr -split ';')) {
+        $item = $entry.Trim()
+        if (-not $item) { continue }
+        $addr = ($item -replace '^[a-zA-Z0-9.+-]+=', '').Trim().ToLowerInvariant()
+        if ($addr -match '^(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):(\\d+)$') {
+            if ([int]$Matches[1] -eq $portNum) { return $true }
+        }
+    }
+    return $false
+}
+
+$coreInit = $null
+if ($mihomoPid -gt 0) {
+    $coreInit = Get-Process -Id $mihomoPid -ErrorAction SilentlyContinue
+}
 
 if ($parentPid -gt 0) {
     $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
@@ -129,7 +161,7 @@ $proxy = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
 
 # 关键安全隔离：仅当注册表代理依然指向 NexLink 自身的 targetPort 时，才执行备份还原或清理！
 # 如果用户已切换到 Clash Verge (7897) 或其他客户端，绝对不误动注册表！
-if ($proxy -and $proxy.ProxyServer -match "^(?:http=)?(?:127\\.0\\.0\\.1|localhost):$targetPort(\\D|$)") {
+if ($proxy -and (Test-ProxyServerMatchesPort ([string]$proxy.ProxyServer) $targetPort)) {
     $backup = $null
     if ($backupFilePath -and (Test-Path -LiteralPath $backupFilePath)) {
         try {
@@ -154,7 +186,7 @@ if ($proxy -and $proxy.ProxyServer -match "^(?:http=)?(?:127\\.0\\.0\\.1|localho
         $bkAutoConfig = ''
         if ($backup.autoConfigURL) { $bkAutoConfig = ([string]$backup.autoConfigURL).Trim() }
 
-        $isLoopbackSelf = ($bkServer.ToLower() -match '(?:^|[=;\\s])(?:127\\.0\\.0\\.1|localhost):') -and ($bkServer -match ":$targetPort(?:[^0-9]|$)")
+        $isLoopbackSelf = Test-ProxyServerMatchesPort $bkServer $targetPort
         $hasOtherClient = ($bkEnable -eq 1) -and (-not [string]::IsNullOrWhiteSpace($bkServer)) -and (-not $isLoopbackSelf)
 
         if ($hasOtherClient) {
@@ -205,10 +237,30 @@ if ($proxy -and $proxy.ProxyServer -match "^(?:http=)?(?:127\\.0\\.0\\.1|localho
     [WinINetGuardFast]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0)
 }
 
-if ($mihomoPid -gt 0) {
+if ($mihomoPid -gt 0 -and $null -ne $coreInit) {
     $coreProc = Get-Process -Id $mihomoPid -ErrorAction SilentlyContinue
     if ($coreProc -and $coreProc.ProcessName -eq 'mihomo') {
-        Stop-Process -Id $mihomoPid -Force -ErrorAction SilentlyContinue
+        $sameStart = $false
+        $samePath = $true
+        try {
+            $sameStart = ($coreProc.StartTime -eq $coreInit.StartTime)
+        } catch {
+            $sameStart = $false
+        }
+        if (-not [string]::IsNullOrWhiteSpace($expectedMihomoPath)) {
+            $samePath = $false
+            try {
+                $procPath = $coreProc.Path
+                if ($procPath -and ($procPath.Trim().ToLowerInvariant() -eq $expectedMihomoPath.Trim().ToLowerInvariant())) {
+                    $samePath = $true
+                }
+            } catch {
+                $samePath = $false
+            }
+        }
+        if ($sameStart -and $samePath) {
+            Stop-Process -Id $mihomoPid -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 `;

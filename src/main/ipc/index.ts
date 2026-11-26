@@ -515,7 +515,12 @@ export function registerIpcHandlers(
         console.log('[IPC] 核心未运行，已保存系统代理设置但暂不调用 enableProxy');
         return false;
       }
-      return await systemProxyManager.enableProxy(activePort, currentSettings.bypassList, mihomoManager.getPid());
+      return await systemProxyManager.enableProxy(
+        activePort,
+        currentSettings.bypassList,
+        mihomoManager.getPid(),
+        mihomoManager.getMihomoExePath()
+      );
     } else {
       return await systemProxyManager.restoreProxy(activePort);
     }
@@ -591,7 +596,8 @@ export function registerIpcHandlers(
             await systemProxyManager.enableProxy(
               mihomoManager.getStatus().mixedPort || updated.mixedPort || 7890,
               updated.bypassList,
-              mihomoManager.getPid()
+              mihomoManager.getPid(),
+              mihomoManager.getMihomoExePath()
             );
           } else {
             console.log('[IPC] 核心未运行，系统代理设置已保存但暂不调用 enableProxy');
@@ -608,7 +614,8 @@ export function registerIpcHandlers(
           await systemProxyManager.enableProxy(
             mihomoManager.getStatus().mixedPort || updated.mixedPort || 7890,
             updated.bypassList,
-            mihomoManager.getPid()
+            mihomoManager.getPid(),
+            mihomoManager.getMihomoExePath()
           );
         }
       }

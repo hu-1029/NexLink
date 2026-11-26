@@ -1409,7 +1409,12 @@ export class MihomoProcessManager {
 
       // 9. 若开启了系统代理，配置 Windows 注册表并激活独立看门狗守护（同步携带用户自定义绕过白名单）
       if (settings.systemProxy) {
-        await systemProxyManager.enableProxy(actualMixedPort, settings.bypassList, activePid);
+        await systemProxyManager.enableProxy(
+          actualMixedPort,
+          settings.bypassList,
+          activePid,
+          this.mihomoExePath
+        );
       }
 
       if (tunDowngradeWarning) {

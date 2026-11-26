@@ -223,4 +223,80 @@ Write-Output 'AST_OK'
       assert.strictEqual(out.trim(), 'AST_OK');
     }
   });
+
+  it('5. Patch C: isPortMatching / isLocalProxy 严格按分号与主机边界解析，ProxyGuard 具备 $coreInit + Path + StartTime 防 PID 复用', async () => {
+    const { isLocalProxy } = await import('../../src/main/network/system-proxy');
+    const { isPortMatching } = await import('../../src/main/network/proxy-guard');
+
+    // isPortMatching: 分号多条目 + [::1] + 精确端口边界
+    assert.strictEqual(isPortMatching('127.0.0.1:7890', 7890), true);
+    assert.strictEqual(isPortMatching('http=127.0.0.1:7890;https=[::1]:7890', 7890), true);
+    assert.strictEqual(isPortMatching('[::1]:7890', 7890), true);
+    assert.strictEqual(isPortMatching('http://evil.com/127.0.0.1:7890', 7890), false);
+    assert.strictEqual(isPortMatching('127.0.0.1:78901', 7890), false);
+    assert.strictEqual(isPortMatching('127.0.0.2:7890', 7890), false);
+
+    // isLocalProxy: 主机边界校验
+    assert.strictEqual(isLocalProxy('127.0.0.1:7890'), true);
+    assert.strictEqual(isLocalProxy('http=localhost:7890'), true);
+    assert.strictEqual(isLocalProxy('socks=[::1]:1080'), true);
+    assert.strictEqual(isLocalProxy('my-localhost-proxy.com:8080'), false);
+    assert.strictEqual(isLocalProxy('proxy.127.0.0.1.nip.io:8080'), false);
+
+    // ProxyGuard 脚本应包含预期 mihomoExePath、$coreInit 判空及 StartTime + Path 双重比对
+    const script = buildProxyGuardScript({
+      parentPid: 1234,
+      proxyPort: 7890,
+      mihomoPid: 5678,
+      mihomoExePath: 'C:\\Program Files\\NexLink\\resources\\mihomo\\mihomo.exe',
+    });
+    assert.ok(script.includes('$coreInit = Get-Process -Id $mihomoPid'));
+    assert.ok(script.includes('$null -ne $coreInit'));
+    assert.ok(script.includes('$coreProc.StartTime -eq $coreInit.StartTime'));
+    assert.ok(script.includes('$expectedMihomoPath'));
+    assert.ok(script.includes('$coreProc.Path'));
+  });
+
+  it('6. Patch C: build/installer.nsh 卸载清代理脚本具备 C:\\ProgramData 回退、TCP 端口探测且经 AST 解析 0 语法错误', () => {
+    const nsh = fs.readFileSync(path.resolve('build/installer.nsh'), 'utf8');
+    assert.ok(nsh.includes('StrCpy $4 "C:\\ProgramData"'), 'ProgramData 为空时必须回退到 C:\\ProgramData');
+
+    const proxyCleanLine = nsh
+      .split(/\r?\n/)
+      .find((line) => line.includes('nsExec::ExecToStack') && line.includes('powershell.exe') && line.includes('TcpClient'));
+    assert.ok(proxyCleanLine, '必须包含基于 TcpClient 探测的卸载清代理 PowerShell 调用');
+
+    const cmdMatch = proxyCleanLine!.match(/-Command\s+"([\s\S]+)"'/);
+    assert.ok(cmdMatch && cmdMatch[1], '必须能提取卸载清代理 PowerShell 命令体');
+
+    const expandedPsCode = cmdMatch![1]
+      .replace(/\$\$/g, '$')
+      .replace(/\$\\'/g, "'")
+      .replace(/\\"/g, '"');
+    assert.ok(expandedPsCode.includes('TcpClient'));
+    assert.ok(expandedPsCode.includes('anyAlive'));
+
+    if (process.platform === 'win32') {
+      const codeB64 = Buffer.from(expandedPsCode, 'utf8').toString('base64');
+      const parseCheckScript = `
+$code = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${codeB64}'))
+$tokens = $null
+$errors = $null
+[void][System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$tokens, [ref]$errors)
+if ($errors -and $errors.Count -gt 0) {
+  $msgs = ($errors | ForEach-Object { $_.Message }) -join '; '
+  Write-Error "PowerShell AST parse errors: $msgs"
+  exit 1
+}
+Write-Output 'AST_OK'
+`;
+      const encodedCheck = Buffer.from(parseCheckScript, 'utf16le').toString('base64');
+      const out = execFileSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encodedCheck],
+        { encoding: 'utf8', windowsHide: true, timeout: 10000 }
+      );
+      assert.strictEqual(out.trim(), 'AST_OK');
+    }
+  });
 });

@@ -201,7 +201,12 @@ export function updateTrayContextMenu(): void {
         const activePort = mihomoManager.getStatus().mixedPort || currentSettings.mixedPort || 7890;
         if (item.checked) {
           if (mihomoManager.getStatus().running) {
-            await systemProxyManager.enableProxy(activePort, currentSettings.bypassList, mihomoManager.getPid());
+            await systemProxyManager.enableProxy(
+              activePort,
+              currentSettings.bypassList,
+              mihomoManager.getPid(),
+              mihomoManager.getMihomoExePath()
+            );
           } else {
             console.log('[Tray] 核心未运行，已保存系统代理设置但暂不调用 enableProxy');
           }

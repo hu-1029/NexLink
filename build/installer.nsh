@@ -3,6 +3,13 @@
 !macro customUnInstall
   ${ifNot} ${isUpdated}
     ReadEnvStr $4 ProgramData
+    ${if} $4 == ""
+      StrCpy $4 "C:\ProgramData"
+    ${endIf}
+    ; 卸载时探测 HKCU 代理：仅清理无进程监听的本机回环死代理，绝不误杀 Clash Verge 等活跃客户端
+    nsExec::ExecToStack 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$p = Get-ItemProperty -Path $\'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings$\' -ErrorAction SilentlyContinue; if ($$p -and $$p.ProxyEnable -eq 1 -and $$p.ProxyServer) { $$loopbacks = @(); foreach ($$e in ([string]$$p.ProxyServer -split $\';$\')) { $$a = ($$e.Trim() -replace $\'^[a-zA-Z0-9.+-]+=$\', $\'$\').Trim(); if ($$a -match $\'^(127\\.0\\.0\\.1|localhost|\\[::1\\]):(\\d+)$\') { $$h = if ($$Matches[1] -eq $\'[::1]$\') { $\'::1$\' } else { $$Matches[1] }; $$loopbacks += @{ Host = $$h; Port = [int]$$Matches[2] } } }; if ($$loopbacks.Count -gt 0) { $$anyAlive = $$false; foreach ($$ep in $$loopbacks) { try { $$c = New-Object System.Net.Sockets.TcpClient; $$ar = $$c.BeginConnect($$ep.Host, $$ep.Port, $$null, $$null); if ($$ar.AsyncWaitHandle.WaitOne(200) -and $$c.Connected) { $$anyAlive = $$true }; $$c.Close() } catch {} }; if (-not $$anyAlive) { Set-ItemProperty -Path $\'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings$\' -Name ProxyEnable -Value 0 -Type DWord; Set-ItemProperty -Path $\'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings$\' -Name ProxyServer -Value $\'$\' -Type String; Add-Type -TypeDefinition $\'using System;using System.Runtime.InteropServices;public class WinINetUninst{[DllImport(\"wininet.dll\")]public static extern bool InternetSetOption(IntPtr h,int o,IntPtr b,int l);}$\' -ErrorAction SilentlyContinue; [WinINetUninst]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null; [WinINetUninst]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null } } }"'
+    Pop $8
+    Pop $9
     nsExec::ExecToStack 'sc.exe query NexLinkCoreService'
     Pop $0
     Pop $1

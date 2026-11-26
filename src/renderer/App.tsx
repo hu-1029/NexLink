@@ -219,16 +219,26 @@ export const App: React.FC = () => {
 
   // 监听系统深色/浅色动态变更 (当处于跟随系统模式时即时响应)
   useEffect(() => {
-    applyThemeToDocument(theme, systemDark);
     if (theme === 'system' && typeof window.matchMedia === 'function') {
       const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      const currentDark = mediaQuery.matches;
+      if (currentDark !== systemDark) {
+        setSystemDark(currentDark);
+      }
+      applyThemeToDocument('system', currentDark);
+      const defaults = getDefaultColorsForTheme(currentDark ? 'dark' : 'light');
+      applyThemeColors(defaults.bg, defaults.fg);
+
       const listener = (e: MediaQueryListEvent) => {
         setSystemDark(e.matches);
         document.documentElement.classList.toggle('dark', e.matches);
+        const nextDefaults = getDefaultColorsForTheme(e.matches ? 'dark' : 'light');
+        applyThemeColors(nextDefaults.bg, nextDefaults.fg);
       };
       mediaQuery.addEventListener('change', listener);
       return () => mediaQuery.removeEventListener('change', listener);
     }
+    applyThemeToDocument(theme, systemDark);
   }, [theme, systemDark]);
 
   const handleToggleTun = async (val: boolean) => {

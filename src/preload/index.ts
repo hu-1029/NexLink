@@ -162,7 +162,13 @@ export const nexlinkAPI = {
       ipcRenderer.invoke(IPC_CHANNELS.SYS_RESTART_AS_ADMIN),
     getTunServiceStatus: (): Promise<TunServiceStatus> =>
       ipcRenderer.invoke(IPC_CHANNELS.SYS_TUN_SERVICE_STATUS),
-    installTunService: (): Promise<{ success: boolean; error?: string }> =>
+    installTunService: (): Promise<{
+      success: boolean;
+      error?: string;
+      usedBundledFallback?: boolean;
+      fallbackFromPath?: string;
+      warning?: string;
+    }> =>
       ipcRenderer.invoke(IPC_CHANNELS.SYS_TUN_SERVICE_INSTALL),
     uninstallTunService: (): Promise<{ success: boolean; error?: string }> =>
       ipcRenderer.invoke(IPC_CHANNELS.SYS_TUN_SERVICE_UNINSTALL),
@@ -192,6 +198,7 @@ export const nexlinkAPI = {
   updater: {
     checkUpdate: (options?: {
       repo?: string;
+      includePrerelease?: boolean;
       mockUpdate?: boolean;
       mockVersion?: string;
     }): Promise<UpdateInfo> =>

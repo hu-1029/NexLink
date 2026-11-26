@@ -92,17 +92,30 @@ export function getLiveRegistryProxySync(): {
 }
 
 /**
- * 判断代理服务器地址是否为本地回环死代理
+ * 判断代理服务器地址是否为本地回环地址（按分号逐条解析并校验主机边界）
  */
 export function isLocalProxy(server?: string): boolean {
   if (!server) return false;
-  const s = server.trim().toLowerCase();
-  return (
-    s.includes('127.0.0.1') ||
-    s.includes('localhost') ||
-    s.includes('::1') ||
-    s.startsWith('127.')
-  );
+  const entries = server
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const entry of entries) {
+    const addr = entry
+      .replace(/^[a-z0-9.+-]+=/i, '')
+      .replace(/^[a-z0-9.+-]+:\/\//i, '')
+      .trim()
+      .toLowerCase();
+    if (
+      /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?$/.test(addr) ||
+      /^localhost(?::\d+)?$/.test(addr) ||
+      /^\[::1\](?::\d+)?$/.test(addr) ||
+      /^::1(?::\d+)?$/.test(addr)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function runPowerShell(script: string): Promise<string> {
@@ -293,7 +306,12 @@ export class SystemProxyManager {
   /**
    * 开启 NexLink 系统代理
    */
-  async enableProxy(port: number = 7890, bypassList?: string, mihomoPid?: number): Promise<boolean> {
+  async enableProxy(
+    port: number = 7890,
+    bypassList?: string,
+    mihomoPid?: number,
+    mihomoExePath?: string
+  ): Promise<boolean> {
     if (!isValidPort(port)) {
       console.error(`[SystemProxy] 拒绝设置非法代理端口: ${port}`);
       return false;
@@ -341,6 +359,7 @@ Add-Type -TypeDefinition $source -ErrorAction SilentlyContinue
         parentPid: process.pid,
         proxyPort: port,
         mihomoPid,
+        mihomoExePath,
         backupFilePath: this.backupFilePath || undefined,
       });
       return true;
