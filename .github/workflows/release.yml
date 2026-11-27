@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build & Publish Windows Installers
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Prepare verified Mihomo core binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/prepare-mihomo.mjs
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run test suite
+        run: npm test
+
+      - name: Build application bundles
+        run: npm run build
+
+      - name: Package Windows Setup & Portable installers
+        run: npx --yes electron-builder --win nsis portable
+
+      - name: Generate SHASUMS256.txt
+        shell: pwsh
+        run: |
+          $targets = @(
+            'release\Windows-NexLink-Setup.exe',
+            'release\Windows-NexLink-Portable.exe'
+          )
+          $lines = foreach ($file in $targets) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Expected release artifact missing: $file"
+            }
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $name = Split-Path -Leaf $file
+            "$hash  $name"
+          }
+          $outPath = Join-Path (Resolve-Path 'release').Path 'SHASUMS256.txt'
+          [System.IO.File]::WriteAllText($outPath, ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+          Get-Content -LiteralPath $outPath
+
+      - name: Upload workflow build artifacts (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexlink-windows-installers
+          path: |
+            release/Windows-NexLink-Setup.exe
+            release/Windows-NexLink-Portable.exe
+            release/SHASUMS256.txt
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/Windows-NexLink-Setup.exe
+            release/Windows-NexLink-Portable.exe
+            release/SHASUMS256.txt
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
