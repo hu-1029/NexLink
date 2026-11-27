@@ -10,7 +10,7 @@
     "dev": "vite",
     "prebuild": "node scripts/update-mihomo-hash.js",
     "build": "tsc -b && vite build",
-    "test": "tsx --test --test-concurrency=1 tests/**/*.test.ts",
+    "test": "node scripts/run-tests.mjs",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "dist": "npm run build && electron-builder"
