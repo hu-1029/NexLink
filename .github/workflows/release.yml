@@ -50,7 +50,7 @@ jobs:
         run: npm run build
 
       - name: Package Windows Setup & Portable installers
-        run: npx --yes electron-builder --win nsis portable
+        run: npx --yes electron-builder --win nsis portable --publish never
 
       - name: Generate SHASUMS256.txt
         shell: pwsh
