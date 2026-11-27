@@ -91,16 +91,19 @@ async function resolveExpectedSha256(assets, asset, headers) {
   return genericMatch ? genericMatch[1].toLowerCase() : null;
 }
 
+const DEFAULT_MIHOMO_VERSION = 'v1.19.29';
+
 async function main() {
   if (fs.existsSync(targetExe) && fs.statSync(targetExe).size > 1024 * 1024) {
     console.log(`[prepare-mihomo] Existing binary found at ${targetExe}, skipping download.`);
     return;
   }
 
-  const versionTag = (process.env.MIHOMO_VERSION || '').trim();
-  const releaseApiUrl = versionTag
-    ? `https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${encodeURIComponent(versionTag)}`
-    : 'https://api.github.com/repos/MetaCubeX/mihomo/releases/latest';
+  const requestedVersion = (process.env.MIHOMO_VERSION || DEFAULT_MIHOMO_VERSION).trim();
+  const releaseApiUrl =
+    requestedVersion.toLowerCase() === 'latest'
+      ? 'https://api.github.com/repos/MetaCubeX/mihomo/releases/latest'
+      : `https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/${encodeURIComponent(requestedVersion)}`;
 
   const headers = {
     'User-Agent': 'NexLink-Build-Script',

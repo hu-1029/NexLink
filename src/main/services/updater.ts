@@ -830,21 +830,11 @@ export class UpdateService {
           return { success: true };
         }
 
-        if (Electron.shell?.openPath) {
-          const openErr = await Electron.shell.openPath(targetPath);
-          if (!openErr) {
-            if (this.beforeQuitCallback) {
-              try { await this.beforeQuitCallback(); } catch { /* ignore */ }
-            }
-            setTimeout(() => { Electron.app?.quit?.(); }, 400);
-            return { success: true };
-          }
-          console.warn('[UpdateService] shell.openPath 失败，尝试回退 spawn:', openErr);
-        }
-        // 1. 回退拉起新安装程序 (Windows NSIS / InnoSetup)
-        const child = spawn(targetPath, [], {
+        // 1. 以静默覆盖升级模式拉起 Windows NSIS 安装程序（原位覆盖安装目录并在完成后自动重开新版）
+        const child = spawn(targetPath, ['--updated', '--force-run', '/S'], {
           detached: true,
           stdio: 'ignore',
+          windowsHide: true,
         });
 
         // 2. 监听子进程启动状态，设置 1000ms 观察窗口，捕获 UAC 拒绝或杀毒软件拦截
@@ -876,7 +866,11 @@ export class UpdateService {
           };
         }
 
-        // 4. 确认安装程序已成功运行后，再平滑停止核心与恢复系统代理
+        // 4. 确认安装程序已成功运行后，再清理托盘/看门狗并平滑停止核心与恢复系统代理
+        if (this.beforeQuitCallback) {
+          try { await this.beforeQuitCallback(); } catch { /* ignore */ }
+        }
+
         try {
           const currentSettings = storageManager.getSettings();
           systemProxyManager.restoreProxySync(currentSettings?.mixedPort || 7890);
@@ -892,7 +886,7 @@ export class UpdateService {
 
         child.unref();
 
-        // 5. 退出主程序
+        // 5. 退出主程序，交由静默安装程序原地覆盖更新并自动重启新版
         if (Electron.app?.quit) {
           Electron.app.quit();
         }

@@ -119,8 +119,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
   const [downHistory, setDownHistory] = useState<number[]>([0, 0, 0, 0, 0]);
   const [upHistory, setUpHistory] = useState<number[]>([0, 0, 0, 0, 0]);
 
-  // 真实活跃连接
+  // 真实活跃连接（列表保留前 50 条防渲染卡顿，activeConnCount 保留内核实际并发总数）
   const [connections, setConnections] = useState<any[]>([]);
+  const [activeConnCount, setActiveConnCount] = useState<number>(0);
 
   // 核心运行时长计时器 (HH:mm:ss)
   const [uptimeStr, setUptimeStr] = useState<string>('00:00:00');
@@ -224,6 +225,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       setDownHistory([0, 0, 0, 0]);
       setUpHistory([0, 0, 0, 0]);
       setConnections([]);
+      setActiveConnCount(0);
       seenConnIdsRef.current.clear();
       seenDnsReqIdsRef.current.clear();
       peakDownBytesRef.current = 0;
@@ -316,8 +318,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         window.nexlinkAPI.core
           .getConnections()
           .then((res: any) => {
-            if (res?.connections) {
-              setConnections(res.connections.slice(0, 10));
+            if (Array.isArray(res?.connections)) {
+              setActiveConnCount(res.connections.length);
+              setConnections(res.connections.slice(0, 50));
               res.connections.forEach((c: any) => {
                 if (c.id && !seenConnIdsRef.current.has(c.id)) {
                   if (seenConnIdsRef.current.size >= 5000) {
@@ -411,6 +414,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
       try {
         await window.nexlinkAPI.core.closeConnection('');
         setConnections([]);
+        setActiveConnCount(0);
       } catch {
         // 静默
       }
@@ -1166,7 +1170,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
         <Card className="col-span-12 md:col-span-6 flex items-center justify-around p-4 bg-white dark:bg-[#181c26]">
           <div className="text-center">
             <div className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white tabular-nums">
-              {coreStatus.running ? connections.length : 0}
+              {coreStatus.running ? activeConnCount : 0}
             </div>
             <div className="text-xs text-slate-400 mt-1">实时连接</div>
           </div>
@@ -1357,7 +1361,7 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
                       活跃网络连接
                     </h3>
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-md bg-slate-100 dark:bg-white/5 text-slate-500 tabular-nums">
-                      {connections.length} 并发
+                      {coreStatus.running ? activeConnCount : 0} 并发
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-400 mt-0.5">

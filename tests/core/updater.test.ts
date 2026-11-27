@@ -350,4 +350,22 @@ describe('软件版本检测与自动更新管理器测试 (Updater Tests)', () 
       fs.unlinkSync(dlOk.filePath);
     }
   });
+
+  test('12. Windows 应用内自动更新必须以静默覆盖升级参数 (--updated --force-run /S) 启动安装包，不弹首次安装向导', () => {
+    const updaterSrc = fs.readFileSync(path.resolve('src/main/services/updater.ts'), 'utf8');
+    const installFnIdx = updaterSrc.indexOf('public async installUpdate(');
+    assert.ok(installFnIdx > 0);
+    const endIdx = updaterSrc.indexOf('// macOS / Linux', installFnIdx);
+    assert.ok(endIdx > installFnIdx);
+    const winExeBranch = updaterSrc.slice(installFnIdx, endIdx);
+    assert.ok(
+      winExeBranch.includes("['--updated', '--force-run', '/S']"),
+      'Windows 安装包更新必须传递 --updated --force-run /S 静默原地升级并自动重开新版'
+    );
+    assert.strictEqual(
+      winExeBranch.includes('shell?.openPath'),
+      false,
+      'Windows 安装包更新不应优先走无参 shell.openPath 触发首次安装向导'
+    );
+  });
 });
