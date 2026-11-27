@@ -31,6 +31,12 @@ describe('Claude 审计 6 项问题深度修复专项验证测试', () => {
   it('2. 验证代理端口设为 65534 与 65535 时安全收敛，不发生 +2 溢出且通过实机核心预检', async () => {
     const mihomoExe = path.resolve('resources/mihomo/mihomo.exe');
     const runtimeDir = path.resolve('data/runtime');
+    fs.mkdirSync(runtimeDir, { recursive: true });
+    const srcGeo = path.resolve('resources/rules/geoip.metadb');
+    const dstGeo = path.join(runtimeDir, 'geoip.metadb');
+    if (fs.existsSync(srcGeo) && !fs.existsSync(dstGeo)) {
+      fs.copyFileSync(srcGeo, dstGeo);
+    }
 
     // 测试 65534 (mixedPort + 2 = 65536 原先会溢出)
     const cfg65534 = buildMihomoConfig({
@@ -62,6 +68,7 @@ describe('Claude 审计 6 项问题深度修复专项验证测试', () => {
   it('3. 验证端口冲突保护：当 mixedPort+1 与 apiPort 冲突时自动压制冲突端口', async () => {
     const mihomoExe = path.resolve('resources/mihomo/mihomo.exe');
     const runtimeDir = path.resolve('data/runtime');
+    fs.mkdirSync(runtimeDir, { recursive: true });
 
     // mixedPort = 9096, apiPort = 9097 -> mixedPort + 1 原本会生成 port: 9097 发生撞车
     const cfg = buildMihomoConfig({

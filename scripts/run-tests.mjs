@@ -30,10 +30,12 @@ if (testFiles.length === 0) {
 }
 
 const tsxCli = path.join(rootDir, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+const childEnv = { ...process.env };
+delete childEnv.PSModulePath;
 const res = spawnSync(
   process.execPath,
   [tsxCli, '--test', '--test-concurrency=1', ...testFiles],
-  { cwd: rootDir, stdio: 'inherit' }
+  { cwd: rootDir, stdio: 'inherit', env: childEnv }
 );
 
 process.exit(res.status ?? 1);

@@ -172,6 +172,13 @@ export function parseTrustedMihomoManifest(raw: string): TrustedMihomoManifest |
   }
 }
 
+function getCleanWinPsEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  // 防止从 PowerShell 7 (pwsh.exe) 启动时继承不兼容的 PSModulePath，导致 Windows PowerShell 5.1 加载系统安全模块失败
+  delete env.PSModulePath;
+  return env;
+}
+
 /**
  * 检查 Windows 文件及完整父目录链的 ACL 与重解析点（严格 fail-closed）：
  * 拒绝任何普通用户可写、可修改、可删除、可篡改权限的目录或文件，防止验证后替换安装源。
@@ -193,7 +200,7 @@ export function verifyWindowsPathAclChainSync(targetPath: string): AclCheckResul
     "    $it = Get-Item -LiteralPath $cur -Force",
     "    if ($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { [PSCustomObject]@{ locked=$false; reason='Reparse point detected'; unsafePath=$cur } | ConvertTo-Json -Compress; exit 0 }",
     "    if ($programData -and [string]::Equals($cur, $programData, [System.StringComparison]::OrdinalIgnoreCase)) { break }",
-    "    $acl = Get-Acl -LiteralPath $cur",
+    "    $acl = $it.GetAccessControl()",
     "    $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value",
     "    if ($trusted -notcontains $ownerSid) {",
     "        [PSCustomObject]@{ locked=$false; reason='Untrusted NTFS owner SID'; unsafePath=$cur; unsafeSid=$ownerSid } | ConvertTo-Json -Compress; exit 0",
@@ -218,7 +225,7 @@ export function verifyWindowsPathAclChainSync(targetPath: string): AclCheckResul
     const out = execFileSync(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShellCommand(script)],
-      { encoding: 'utf8', timeout: 4000, windowsHide: true }
+      { encoding: 'utf8', timeout: 4000, windowsHide: true, env: getCleanWinPsEnv() }
     ).trim();
     if (!out) return { locked: false, reason: 'Empty ACL verification result' };
     const parsed = JSON.parse(out) as AclCheckResult;
@@ -252,7 +259,7 @@ export function verifyWindowsAuthenticodeSync(filePath: string): AuthenticodeChe
     const out = execFileSync(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodePowerShellCommand(script)],
-      { encoding: 'utf8', timeout: 4000, windowsHide: true }
+      { encoding: 'utf8', timeout: 4000, windowsHide: true, env: getCleanWinPsEnv() }
     ).trim();
     if (!out) return { valid: false, reason: 'Empty Authenticode result' };
     const parsed = JSON.parse(out) as AuthenticodeCheckResult;
@@ -334,8 +341,13 @@ export function verifyMihomoInstallSource(
 
   const tryVerifyManifestFile = (manifestFilePath: string, requireBinAcl: boolean): MihomoSourceTrustResult | null => {
     try {
-      if (!fs.existsSync(manifestFilePath)) return null;
-      const manifestStat = fs.lstatSync(manifestFilePath);
+      let manifestStat: fs.Stats;
+      try {
+        manifestStat = fs.lstatSync(manifestFilePath);
+      } catch (statErr: any) {
+        if (statErr?.code === 'ENOENT') return null;
+        throw statErr;
+      }
       if (!manifestStat.isFile() || manifestStat.isSymbolicLink()) {
         return {
           trusted: false,
