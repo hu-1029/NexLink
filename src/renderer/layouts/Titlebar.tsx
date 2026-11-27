@@ -49,9 +49,11 @@ export const Titlebar: React.FC<TitlebarProps> = ({
           <img src={appIcon} alt="NexLink" className="w-5 h-5 rounded object-contain select-none pointer-events-none" />
           <span className="text-xs font-bold tracking-wide text-slate-800 dark:text-slate-200">
             NexLink
-            <span className="text-[10px] text-slate-400 font-medium tabular-nums ml-1.5">
-              v{appVersion || '0.1.0'}
-            </span>
+            {appVersion && (
+              <span className="text-[10px] text-slate-400 font-medium tabular-nums ml-1.5">
+                v{appVersion}
+              </span>
+            )}
           </span>
         </div>
 

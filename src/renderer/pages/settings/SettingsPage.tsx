@@ -1003,9 +1003,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   软件版本与自动更新
                 </h3>
               </div>
-              <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 font-bold border border-blue-500/20 shrink-0">
-                v{appVersion || '0.1.0'}
-              </span>
+              {appVersion && (
+                <span className="text-[11px] font-mono px-2.5 py-0.5 rounded-full bg-blue-500/10 text-blue-600 dark:text-blue-400 font-bold border border-blue-500/20 shrink-0">
+                  v{appVersion}
+                </span>
+              )}
             </div>
 
             <div className="flex flex-col gap-3.5 flex-1 justify-center">

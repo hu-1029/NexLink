@@ -1,5 +1,4 @@
 import React, { useState } from 'react';
-import { Card } from '../../components/common/Card';
 import { Button } from '../../components/common/Button';
 import { Badge } from '../../components/common/Badge';
 import { CountryFlag } from '../../components/common/CountryFlag';
@@ -233,6 +232,48 @@ export const NodesPage: React.FC = () => {
     }
     return 0;
   });
+
+  const renderNodeActions = (node: (typeof sortedNodes)[number], isNodeTesting: boolean) => (
+    <div
+      className={`flex items-center justify-end gap-1 transition-opacity ${
+        isNodeTesting ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+      }`}
+    >
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          testSingleNodeDelay(node.id);
+        }}
+        disabled={isNodeTesting}
+        className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-slate-100 dark:hover:bg-white/10 disabled:opacity-40 transition-colors"
+        title={`使用 [${delayTestMethod}] 测试此节点`}
+      >
+        <RefreshCw className={`w-3.5 h-3.5 ${isNodeTesting ? 'animate-spin text-blue-500' : ''}`} />
+      </button>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          setInspectNode(node);
+        }}
+        className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-slate-100 dark:hover:bg-white/10 transition-colors"
+        title="查看参数"
+      >
+        <Info className="w-3.5 h-3.5" />
+      </button>
+      <button
+        onClick={(e) => {
+          e.stopPropagation();
+          if (confirm(`确定要移除节点 "${node.name}" 吗？`)) {
+            deleteNode(node.id);
+          }
+        }}
+        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition-colors"
+        title="删除节点"
+      >
+        <Trash2 className="w-3.5 h-3.5" />
+      </button>
+    </div>
+  );
 
   return (
     <div className="flex flex-col gap-4 max-w-7xl mx-auto animate-in fade-in duration-200 select-none pb-8">
@@ -926,41 +967,7 @@ export const NodesPage: React.FC = () => {
                     </span>
                   )}
 
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        testSingleNodeDelay(node.id);
-                      }}
-                      disabled={isNodeTesting}
-                      className="p-1 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-slate-100 dark:hover:bg-white/10 disabled:opacity-40"
-                      title={`使用 [${delayTestMethod}] 测试此节点`}
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${isNodeTesting ? 'animate-spin text-blue-500' : ''}`} />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setInspectNode(node);
-                      }}
-                      className="p-1 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-slate-100 dark:hover:bg-white/10"
-                      title="查看参数"
-                    >
-                      <Info className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (confirm(`确定要移除节点 "${node.name}" 吗？`)) {
-                          deleteNode(node.id);
-                        }
-                      }}
-                      className="p-1 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-50"
-                      title="删除节点"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
+                  {renderNodeActions(node, isNodeTesting)}
                 </div>
               </div>
             );
@@ -969,165 +976,169 @@ export const NodesPage: React.FC = () => {
 
         </div>
       ) : (
-        /* 紧凑列表模式 */
-        <Card className="p-0 overflow-hidden">
-          <table className="w-full text-left text-xs">
-            <thead>
-              <tr className="border-b border-slate-100 dark:border-white/5 text-slate-400 text-xs bg-slate-50/50 dark:bg-black/20">
-                <th className="py-3 px-4 w-12">状态</th>
-                <th className="py-3 px-4">节点名称</th>
-                <th className="py-3 px-4">协议</th>
-                <th className="py-3 px-4">服务器地址与端口</th>
-                <th className="py-3 px-4">延迟</th>
-                <th className="py-3 px-4 text-right">操作</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100 dark:divide-white/5 font-mono">
-              {/* 列表模式：智能优选置顶第1行 */}
-              {shouldShowAutoCard && (
-                <tr
-                  onClick={() => setActiveOutboundMode('auto')}
-                  className={`cursor-pointer transition-colors ${
-                    isAutoSelected
-                      ? 'bg-blue-50/40 dark:bg-blue-500/10'
-                      : 'hover:bg-slate-50 dark:hover:bg-white/[0.02]'
+        /* 独立长条卡片列表模式 */
+        <div className="flex flex-col gap-2.5">
+          {/* 列表模式：智能优选置顶第 1 张独立长条卡片 */}
+          {shouldShowAutoCard && (
+            <div
+              onClick={() => setActiveOutboundMode('auto')}
+              className={`px-4 py-3 rounded-2xl transition-all duration-200 cursor-pointer select-none group grid grid-cols-[24px_minmax(0,1.4fr)_116px_minmax(0,1.2fr)_auto_88px] items-center gap-3 ${
+                isAutoSelected
+                  ? 'bg-blue-50/40 dark:bg-blue-500/10 border-2 border-blue-500 shadow-[0_4px_18px_rgba(37,99,235,0.12)]'
+                  : 'glow-card bg-white dark:bg-[#181c26] shadow-[0_2px_14px_rgba(0,0,0,0.025)]'
+              }`}
+            >
+              <div className="flex items-center justify-center">
+                {isAutoSelected ? (
+                  <span className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-sm">
+                    <Check className="w-3 h-3 stroke-[3]" />
+                  </span>
+                ) : (
+                  <span className="w-2.5 h-2.5 rounded-full bg-slate-300 dark:bg-slate-600" />
+                )}
+              </div>
+
+              <div className="flex items-center gap-2 min-w-0">
+                <Zap className="w-4 h-4 text-slate-700 dark:text-slate-300 fill-slate-700 dark:fill-slate-300 shrink-0" />
+                <span
+                  className={`text-xs font-bold truncate ${
+                    isAutoSelected ? 'text-blue-600 dark:text-blue-400 font-extrabold' : 'text-slate-800 dark:text-slate-100'
                   }`}
                 >
-                  <td className="py-3 px-4">
-                    {isAutoSelected ? (
-                      <span className="w-4 h-4 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-sm">
-                        <Check className="w-2.5 h-2.5 stroke-[3]" />
-                      </span>
-                    ) : (
-                      <span className="w-2 h-2 rounded-full bg-slate-400 inline-block ml-1" />
-                    )}
-                  </td>
-                  <td className="py-3 px-4 font-sans font-bold text-slate-800 dark:text-slate-200">
-                    <div className="flex items-center gap-2">
-                      <Zap className="w-4 h-4 text-slate-700 dark:text-slate-300 fill-slate-700 dark:fill-slate-300" />
-                      <span>⚡ 自动测速选择</span>
-                    </div>
-                  </td>
-                  <td className="py-3 px-4">
-                    <span className="w-3 h-3 rounded-full bg-slate-600 dark:bg-slate-400 shadow-xs inline-block ml-1" title="智能优选" />
-                  </td>
-                  <td className="py-3 px-4 text-slate-500 text-xs font-mono">
-                    {fastestNode ? `当前优选: ${fastestNode.name}` : '自动分流至最低延迟节点'}
-                  </td>
-                  <td className="py-3 px-4">
-                    {(() => {
-                      const hasFastestDelay = fastestNode && typeof fastestNode.delay === 'number' && fastestNode.delay > 0;
-                      const latency = hasFastestDelay ? getLatencyColor(fastestNode.delay) : null;
-                      return (
-                        <span
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            testAllDelays();
-                          }}
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold tabular-nums border cursor-pointer hover:opacity-80 transition-opacity ${
-                            latency
-                              ? `${latency.bg} ${latency.text} ${latency.border}`
-                              : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-white/10 dark:text-slate-300 dark:border-white/10'
-                          }`}
-                        >
-                          <span className={`w-1.5 h-1.5 rounded-full ${latency ? latency.dot : 'bg-slate-400'}`} />
-                          {hasFastestDelay ? `${fastestNode.delay} ms` : '并发优选'}
-                        </span>
-                      );
-                    })()}
-                  </td>
-                  <td className="py-3 px-4 text-right">
-                    <span className="text-[11px] text-blue-600 font-bold">
-                      {isAutoSelected ? '已生效' : ''}
+                  自动测速选择
+                </span>
+              </div>
+
+              <div>
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border border-slate-200/60 dark:border-slate-700 whitespace-nowrap">
+                  智能优选
+                </span>
+              </div>
+
+              <div className="text-slate-500 dark:text-slate-400 text-xs font-mono truncate">
+                {fastestNode ? `当前优选: ${fastestNode.name}` : '自动分流至最低延迟节点'}
+              </div>
+
+              <div className="flex justify-end">
+                {(() => {
+                  const hasFastestDelay = fastestNode && typeof fastestNode.delay === 'number' && fastestNode.delay > 0;
+                  const latency = hasFastestDelay ? getLatencyColor(fastestNode.delay) : null;
+                  return (
+                    <span
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        testAllDelays();
+                      }}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold font-mono tabular-nums border cursor-pointer hover:opacity-80 transition-opacity whitespace-nowrap shrink-0 ${
+                        latency
+                          ? `${latency.bg} ${latency.text} ${latency.border}`
+                          : 'bg-slate-100 text-slate-600 border-slate-200 dark:bg-white/10 dark:text-slate-300 dark:border-white/10'
+                      }`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${latency ? latency.dot : 'bg-slate-400'}`} />
+                      {hasFastestDelay ? `${fastestNode.delay} ms` : '并发优选'}
                     </span>
-                  </td>
-                </tr>
-              )}
+                  );
+                })()}
+              </div>
 
-              {sortedNodes.map((node) => {
-                const isSelected = !isAutoSelected && !activeChainId && activeNodeId === node.id;
-                const latency = getLatencyColor(node.delay);
-                const { countryCode: displayCountry } = getNodeCountry(node);
-                const isNodeTesting = testingNodeIds.includes(node.id);
+              <div className="flex items-center justify-end gap-1">
+                {isAutoSelected && (
+                  <span className="text-[11px] text-blue-600 dark:text-blue-400 font-bold whitespace-nowrap mr-0.5">
+                    已生效
+                  </span>
+                )}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    testAllDelays();
+                  }}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-slate-100 dark:hover:bg-white/10 opacity-0 group-hover:opacity-100 transition-opacity"
+                  title="并发测速全部节点并刷新优选"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+          )}
 
-                return (
-                  <tr
-                    key={node.id}
-                    onClick={() => setActiveNodeId(node.id)}
-                    className={`cursor-pointer transition-colors ${
-                      isSelected
-                        ? 'bg-blue-50/40 dark:bg-blue-500/10'
-                        : 'hover:bg-slate-50 dark:hover:bg-white/[0.02]'
+          {sortedNodes.map((node) => {
+            const isSelected = !isAutoSelected && !activeChainId && activeNodeId === node.id;
+            const latency = getLatencyColor(node.delay);
+            const { countryCode: displayCountry } = getNodeCountry(node);
+            const isNodeTesting = testingNodeIds.includes(node.id);
+
+            return (
+              <div
+                key={node.id}
+                onClick={() => setActiveNodeId(node.id)}
+                onDoubleClick={() => setInspectNode(node)}
+                className={`px-4 py-3 rounded-2xl transition-all duration-200 cursor-pointer select-none group grid grid-cols-[24px_minmax(0,1.4fr)_116px_minmax(0,1.2fr)_auto_88px] items-center gap-3 ${
+                  isSelected
+                    ? 'bg-blue-50/40 dark:bg-blue-500/10 border-2 border-blue-500 shadow-[0_4px_18px_rgba(37,99,235,0.12)]'
+                    : 'glow-card bg-white dark:bg-[#181c26] shadow-[0_2px_14px_rgba(0,0,0,0.025)]'
+                }`}
+              >
+                <div className="flex items-center justify-center">
+                  {isSelected ? (
+                    <span className="w-5 h-5 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-sm">
+                      <Check className="w-3 h-3 stroke-[3]" />
+                    </span>
+                  ) : (
+                    <span className="w-2.5 h-2.5 rounded-full bg-slate-300 dark:bg-slate-600" />
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <CountryFlag countryCode={displayCountry} />
+                  <span
+                    className={`text-xs font-bold truncate ${
+                      isSelected ? 'text-blue-600 dark:text-blue-400 font-extrabold' : 'text-slate-800 dark:text-slate-100'
                     }`}
                   >
-                    <td className="py-3 px-4">
-                      {isSelected ? (
-                        <span className="w-4 h-4 rounded-full bg-blue-600 text-white flex items-center justify-center shadow-sm">
-                          <Check className="w-2.5 h-2.5 stroke-[3]" />
-                        </span>
-                      ) : (
-                        <span className="w-2 h-2 rounded-full bg-slate-300 inline-block ml-1" />
-                      )}
-                    </td>
-                    <td className="py-3 px-4 font-sans font-bold text-slate-800 dark:text-slate-200">
-                      <div className="flex items-center gap-2">
-                        <CountryFlag countryCode={displayCountry} />
-                        <span>{node.name}</span>
-                      </div>
-                    </td>
-                    <td className="py-3 px-4">
-                      <div className="flex items-center gap-1.5">
-                        <Badge protocol={node.type} />
-                        <span className="text-[11px] font-bold text-slate-400 font-mono">{displayCountry}</span>
-                      </div>
-                    </td>
-                    <td className="py-3 px-4 text-slate-500">
-                      {node.server}:{node.port}
-                    </td>
-                    <td className="py-3 px-4">
-                      {isNodeTesting ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold font-mono bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 border border-blue-200/60 dark:border-blue-500/30">
-                          <span className="flex items-center gap-0.5">
-                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '0ms' }} />
-                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '150ms' }} />
-                            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '300ms' }} />
-                          </span>
-                          <span className="text-[10px] ml-0.5">测速中...</span>
-                        </span>
-                      ) : (
-                        <span
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            testSingleNodeDelay(node.id);
-                          }}
-                          title={`点击单独测试此节点 (${delayTestMethod})`}
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold font-mono border cursor-pointer hover:opacity-80 transition-opacity ${latency.bg} ${latency.text} ${latency.border}`}
-                        >
-                          <span className={`w-1.5 h-1.5 rounded-full ${latency.dot}`} />
-                          {node.delay === undefined ? '未测速' : node.delay < 0 ? '超时' : `${node.delay} ms`}
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4 text-right">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setInspectNode(node);
-                        }}
-                      >
-                        详情
-                      </Button>
-                    </td>
-                  </tr>
-                );
-              })}
+                    {node.name}
+                  </span>
+                </div>
 
+                <div className="flex items-center gap-1.5 whitespace-nowrap">
+                  <Badge protocol={node.type} />
+                  <span className="text-[11px] font-bold text-slate-400 font-mono">{displayCountry}</span>
+                </div>
 
-            </tbody>
-          </table>
-        </Card>
+                <div className="text-slate-500 dark:text-slate-400 text-xs font-mono truncate">
+                  {node.server}:{node.port}
+                </div>
+
+                <div className="flex justify-end">
+                  {isNodeTesting ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold font-mono bg-blue-50 text-blue-600 dark:bg-blue-500/15 dark:text-blue-400 border border-blue-200/60 dark:border-blue-500/30 whitespace-nowrap shrink-0">
+                      <span className="flex items-center gap-0.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-bounce" style={{ animationDelay: '300ms' }} />
+                      </span>
+                      <span className="text-[10px] ml-0.5">测速中...</span>
+                    </span>
+                  ) : (
+                    <span
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        testSingleNodeDelay(node.id);
+                      }}
+                      title={`点击单独测试此节点 (${delayTestMethod})`}
+                      className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-bold font-mono tabular-nums border cursor-pointer hover:opacity-80 transition-opacity whitespace-nowrap shrink-0 ${latency.bg} ${latency.text} ${latency.border}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${latency.dot}`} />
+                      {node.delay === undefined ? '未测速' : node.delay < 0 ? '超时' : `${node.delay} ms`}
+                    </span>
+                  )}
+                </div>
+
+                {renderNodeActions(node, isNodeTesting)}
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   )}

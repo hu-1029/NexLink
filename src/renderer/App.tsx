@@ -474,6 +474,7 @@ export const App: React.FC = () => {
         onToggleTheme={handleToggleTheme}
         coreRunning={coreStatus.running}
         systemProxy={systemProxy}
+        appVersion={appInfo?.version}
       />
 
       {/* 主体工作区 */}
