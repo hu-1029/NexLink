@@ -115,3 +115,8 @@ npm run dist
 Copyright (C) 2026 hu-1029
 
 本项目采用 [GNU General Public License v3.0 (GPL-3.0)](LICENSE) 协议开源，第三方组件与规则数据声明详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+---
+
+## 代码签名政策
+本项目的 Windows 安装包由 SignPath.io 提供免费代码签名，证书由 SignPath Foundation 颁发（Free code signing provided by SignPath.io, certificate by SignPath Foundation）。签名仅用于证明安装包由本项目构建流程产出，不收集、不上传用户个人信息。
